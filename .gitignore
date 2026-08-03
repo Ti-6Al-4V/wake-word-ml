@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Dataset (не коммитим аудио)
+dataset/
+*.wav
+
+# Models (коммитим только .tflite, не .keras)
+*.keras
+*.h5
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
