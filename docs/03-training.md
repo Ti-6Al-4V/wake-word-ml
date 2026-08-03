@@ -1,248 +1,285 @@
-# Обучение модели
+# Обучение модели на burn
 
-TensorFlow/Keras. CNN для бинарной классификации: wake word / не wake word.
-
----
-
-## Окружение
-
-```bash
-# Python 3.12
-pip install tensorflow[and-cuda] librosa scikit-learn numpy soundfile
-```
-
-Проверка GPU:
-```python
-import tensorflow as tf
-print(tf.config.list_physical_devices('GPU'))  # должен увидеть GPU
-```
-
-Без GPU тоже работает — модель маленькая, обучение ~30 мин на CPU.
+[burn](https://github.com/tracel-ai/burn) — Rust ML framework. WGPU/CUDA backend, типобезопасные тензоры.
 
 ---
 
-## Модель
+## Cargo.toml
 
-```python
-# training/train_model.py
-import tensorflow as tf
-from tensorflow.keras import layers, models
+```toml
+[package]
+name = "wake-word-ml"
+version = "0.1.0"
+edition = "2021"
 
-def build_model(input_shape=(33, 20, 1)):
-    model = models.Sequential([
-        # Conv блок 1
-        layers.Conv2D(16, (3, 3), activation='relu', padding='same',
-                      input_shape=input_shape),
-        layers.MaxPooling2D((2, 2)),
-        layers.Dropout(0.3),
+[dependencies]
+burn = { version = "0.14", features = ["train", "wgpu"] }
+hound = "3.5"
+rustfft = "6.2"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
 
-        # Conv блок 2
-        layers.Conv2D(8, (3, 3), activation='relu', padding='same'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Dropout(0.3),
+[[bin]]
+name = "train"
+path = "src/train.rs"
 
-        # Классификация
-        layers.Flatten(),
-        layers.Dense(16, activation='relu'),
-        layers.Dropout(0.3),
-        layers.Dense(1, activation='sigmoid'),
-    ])
+[[bin]]
+name = "record"
+path = "src/record.rs"
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss='binary_crossentropy',
-        metrics=['accuracy'],
-    )
-
-    return model
+[[bin]]
+name = "export"
+path = "src/export.rs"
 ```
 
-### Архитектура:
+---
 
-```
-Вход: [33, 20, 1] (MFCC матрица, 1 канал)
-    │
-    ▼
-Conv2D(16, 3×3) + ReLU → [33, 20, 16]
-MaxPool(2×2)             → [16, 10, 16]
-Dropout(0.3)
-    │
-    ▼
-Conv2D(8, 3×3) + ReLU   → [16, 10, 8]
-MaxPool(2×2)             → [8, 5, 8]
-Dropout(0.3)
-    │
-    ▼
-Flatten                  → [320]
-Dense(16) + ReLU
-Dropout(0.3)
-    │
-    ▼
-Dense(1) + Sigmoid       → [0.0 ... 1.0]
-```
+## Модель на burn
 
-~5000 параметров. .tflite ~25 KB.
+```rust
+// src/model.rs
+use burn::{
+    nn::{Conv2d, Conv2dConfig, Linear, LinearConfig, Relu, Sigmoid},
+    tensor::{Tensor, backend::AutodiffBackend},
+    module::Module,
+};
+
+#[derive(Module, Debug)]
+pub struct WakeWordModel<B: AutodiffBackend> {
+    conv1: Conv2d<B, 1>,      // 1 канал → 16 фильтров
+    conv2: Conv2d<B, 16>,     // 16 → 8 фильтров
+    fc1: Linear<B>,           // flatten → 16
+    fc2: Linear<B>,           // 16 → 1
+    relu: Relu,
+    sigmoid: Sigmoid,
+}
+
+impl<B: AutodiffBackend> WakeWordModel<B> {
+    pub fn new(device: &B::Device) -> Self {
+        let conv1 = Conv2dConfig::new([1, 16], [3, 3]).with_padding(burn::nn::PaddingConfig2d::Same).init(device);
+        let conv2 = Conv2dConfig::new([16, 8], [3, 3]).with_padding(burn::nn::PaddingConfig2d::Same).init(device);
+
+        // После 2 MaxPool(2,2): [33×20] → [16×10] → [8×5] → flatten = 8*5*8 = 320
+        let fc1 = LinearConfig::new(320, 16).init(device);
+        let fc2 = LinearConfig::new(16, 1).init(device);
+
+        Self {
+            conv1, conv2, fc1, fc2,
+            relu: Relu::new(),
+            sigmoid: Sigmoid::new(),
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
+        // x: [batch, 1, 33, 20]
+        let x = self.conv1.forward(x);    // [batch, 16, 33, 20]
+        let x = self.relu.forward(x);
+        let x = x.max_pool_2d([2, 2], [2, 2], [0, 0]);  // [batch, 16, 16, 10]
+
+        let x = self.conv2.forward(x);    // [batch, 8, 16, 10]
+        let x = self.relu.forward(x);
+        let x = x.max_pool_2d([2, 2], [2, 2], [0, 0]);  // [batch, 8, 8, 5]
+
+        let x = x.flatten(1, 3);         // [batch, 320]
+        let x = self.fc1.forward(x);     // [batch, 16]
+        let x = self.relu.forward(x);
+        let x = self.fc2.forward(x);     // [batch, 1]
+        let x = self.sigmoid.forward(x); // [batch, 1]
+
+        x.squeeze(1)                     // [batch]
+    }
+}
+```
 
 ---
 
 ## Обучение
 
-```python
-# training/train_model.py (продолжение)
+```rust
+// src/train.rs
+use burn::{
+    config::Config,
+    data::{DataLoaderBuilder, dataset::Dataset},
+    optim::AdamConfig,
+    train::{LearnerBuilder, TrainOutput, TrainStep, ValidStep},
+    tensor::{Tensor, backend::{AutodiffBackend, Backend}},
+};
 
-def train():
-    # Загружаем датасет
-    X_train, y_train, X_val, y_val = load_dataset()
+#[derive(Config)]
+pub struct TrainConfig {
+    #[config(default = 50)]
+    pub epochs: usize,
+    #[config(default = 32)]
+    pub batch_size: usize,
+    #[config(default = 1e-3)]
+    pub learning_rate: f64,
+}
 
-    # Добавляем размерность канала: [33, 20] → [33, 20, 1]
-    X_train = X_train[..., np.newaxis]
-    X_val   = X_val[..., np.newaxis]
+impl<B: AutodiffBackend> TrainStep<(Tensor<B, 4>, Tensor<B, 1>), ClassificationLoss<B>>
+    for WakeWordModel<B>
+{
+    fn step(&self, (input, target): (Tensor<B, 4>, Tensor<B, 1>)) -> TrainOutput<ClassificationLoss<B>> {
+        let prediction = self.forward(input);
+        let loss = binary_cross_entropy(&prediction, &target);
 
-    model = build_model()
+        let gradients = loss.backward();
 
-    # Callbacks
-    callbacks = [
-        # Ранняя остановка — если val_loss не улучшается 5 эпох
-        tf.keras.callbacks.EarlyStopping(
-            patience=5, restore_best_weights=True
-        ),
-        # Сохраняем лучшую модель
-        tf.keras.callbacks.ModelCheckpoint(
-            'models/wake_word_best.keras',
-            save_best_only=True, monitor='val_accuracy'
-        ),
-        # Уменьшаем learning rate если застряли
-        tf.keras.callbacks.ReduceLROnPlateau(
-            factor=0.5, patience=3
-        ),
-    ]
+        TrainOutput::new(self, gradients, ClassificationLoss::new(loss))
+    }
+}
 
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=50,
-        batch_size=32,
-        callbacks=callbacks,
-    )
+fn binary_cross_entropy<B: Backend>(
+    pred: &Tensor<B, 2>,
+    target: &Tensor<B, 2>,
+) -> Tensor<B, 1> {
+    let eps = 1e-7;
+    let pred_clipped = pred.clone().clamp(eps, 1.0 - eps);
+    let loss = target.clone() * pred_clipped.clone().log()
+        + (1.0 - target.clone()) * (1.0 - pred_clipped).log();
+    -loss.mean()
+}
 
-    return model, history
+pub fn train<B: AutodiffBackend>(device: B::Device, config: TrainConfig) {
+    let model = WakeWordModel::new(&device);
+    let optimizer = AdamConfig::new().with_learning_rate(config.learning_rate);
+
+    let train_loader = DataLoaderBuilder::new(batch)
+        .build(WakeWordDataset::train());
+    let val_loader = DataLoaderBuilder::new(batch)
+        .build(WakeWordDataset::val());
+
+    let learner = LearnerBuilder::new("models/")
+        .devices(vec![device.clone()])
+        .num_epochs(config.epochs)
+        .build(model, optimizer, 1e-3);
+
+    let model = learner.fit(train_loader, val_loader);
+
+    // Сохраняем модель
+    model.save("models/wake_word.json").unwrap();
+}
 ```
 
-### Параметры:
+---
 
-| Параметр | Значение | Почему |
-|----------|---------|--------|
-| Epochs | 50 (early stop ~15-25) | Модель маленькая, сходится быстро |
-| Batch size | 32 | Стандарт, не перегружает RAM |
-| Learning rate | 0.001 | Adam default, ReduceLROnPlateau уменьшает если застряли |
-| Dropout | 0.3 | Защита от overfitting |
-| Loss | binary_crossentropy | Бинарная классификация |
+## Экспорт весов для ESP32
+
+После обучения извлекаем веса в бинарный формат для C++:
+
+```rust
+// src/export.rs
+use std::io::Write;
+
+pub fn export_weights(model: &WakeWordModel<CpuBackend>, output: &str) {
+    let mut file = std::fs::File::create(output).unwrap();
+
+    // Conv1: weights [16, 1, 3, 3] + bias [16]
+    let conv1_weights = model.conv1.weight.to_data();
+    let conv1_bias = model.conv1.bias.to_data();
+    write_tensor(&mut file, &conv1_weights, &[16, 1, 3, 3]);
+    write_tensor(&mut file, &conv1_bias, &[16]);
+
+    // Conv2: weights [8, 16, 3, 3] + bias [8]
+    let conv2_weights = model.conv2.weight.to_data();
+    let conv2_bias = model.conv2.bias.to_data();
+    write_tensor(&mut file, &conv2_weights, &[8, 16, 3, 3]);
+    write_tensor(&mut file, &conv2_bias, &[8]);
+
+    // FC1: weights [320, 16] + bias [16]
+    let fc1_weights = model.fc1.weight.to_data();
+    let fc1_bias = model.fc1.bias.to_data();
+    write_tensor(&mut file, &fc1_weights, &[320, 16]);
+    write_tensor(&mut file, &fc1_bias, &[16]);
+
+    // FC2: weights [16, 1] + bias [1]
+    let fc2_weights = model.fc2.weight.to_data();
+    let fc2_bias = model.fc2.bias.to_data();
+    write_tensor(&mut file, &fc2_weights, &[16, 1]);
+    write_tensor(&mut file, &fc2_bias, &[1]);
+
+    println!("Exported to {} ({} bytes)", output, file.metadata().unwrap().len());
+}
+
+fn write_tensor(file: &mut std::fs::File, data: &TensorData, shape: &[usize]) {
+    // Header: [ndim, dim0, dim1, ...]
+    file.write_all(&(shape.len() as u32).to_le_bytes()).unwrap();
+    for &dim in shape {
+        file.write_all(&(dim as u32).to_le_bytes()).unwrap();
+    }
+    // Data: f32 values
+    for v in data.iter::<f32>() {
+        file.write_all(&v.to_le_bytes()).unwrap();
+    }
+}
+```
+
+Выходной файл: `models/wake_word.bin` (~20 KB).
 
 ---
 
 ## Оценка
 
-```python
-def evaluate(model, X_test, y_test):
-    loss, accuracy = model.evaluate(X_test, y_test)
-    print(f"Accuracy: {accuracy:.3f}")
+```rust
+pub fn evaluate(model: &WakeWordModel<B>, test_data: &[(Matrix, f32)]) {
+    let mut tp = 0; let mut fp = 0;
+    let mut tn = 0; let mut fn_ = 0;
 
-    # Confusion matrix
-    y_pred = (model.predict(X_test) > 0.5).astype(int)
-    from sklearn.metrics import confusion_matrix
-    cm = confusion_matrix(y_test, y_pred)
-    print(f"Confusion matrix:\n{cm}")
-    # [[TN  FP]
-    #  [FN  TP]]
+    for (mfcc, label) in test_data {
+        let input = tensor_from_mfcc(mfcc);
+        let score = model.forward(input.unsqueeze());
+        let predicted = score > 0.5;
 
-    # False positive rate (важно для wake word)
-    fpr = cm[0][1] / (cm[0][0] + cm[0][1])
-    print(f"False positive rate: {fpr:.4f}")
+        match (predicted, *label > 0.5) {
+            (true, true) => tp += 1,
+            (true, false) => fp += 1,
+            (false, true) => fn_ += 1,
+            (false, false) => tn += 1,
+        }
+    }
+
+    let accuracy = (tp + tn) as f32 / test_data.len() as f32;
+    let fpr = fp as f32 / (fp + tn) as f32;
+    let fnr = fn_ as f32 / (fn_ + tp) as f32;
+
+    println!("Accuracy: {:.3}", accuracy);
+    println!("False positive rate: {:.4}", fpr);
+    println!("False negative rate: {:.4}", fnr);
+}
 ```
 
-### Целевые метрики:
+### Целевые метрики
 
-| Метрика | Цель | Почему |
-|---------|------|--------|
-| Accuracy | >90% | Общая точность |
-| False positive rate | <3% | Кепка не должна просыпаться на другие слова |
-| False negative rate | <10% | Кепка должна слышать "гермес" в 9 из 10 случаев |
-| Model size | <100 KB | Помещается в PSRAM ESP32-S3 |
+| Метрика | Цель |
+|---------|------|
+| Accuracy | >90% |
+| False positive rate | <3% |
+| False negative rate | <10% |
+| Model size | <25 KB |
 
 ---
 
-## Аугментация при обучении
+## Запуск
 
-```python
-# training/augment.py
-import librosa
-import numpy as np
+```bash
+# Установка Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-def augment_audio(y, sr=16000):
-    augmented = []
+# Запись датасета (на ноутбуке)
+cargo run --bin record -- --word "гермес" --count 500 --output dataset/positive/
 
-    # Pitch shift
-    for steps in [-2, 2]:
-        y_shift = librosa.effects.pitch_shift(y, sr=sr, n_steps=steps)
-        augmented.append(y_shift)
+# Обучение
+cargo run --bin train
 
-    # Time stretch
-    for rate in [0.9, 1.1]:
-        y_stretch = librosa.effects.time_stretch(y, rate=rate)
-        augmented.append(y_stretch)
+# Экспорт весов для ESP32
+cargo run --bin export
 
-    # Add noise
-    for snr in [10, 20]:
-        noise = np.random.randn(len(y)) * 0.01 * (10 ** (-snr / 20))
-        augmented.append(y + noise)
-
-    # Volume change
-    for vol in [0.7, 1.3]:
-        augmented.append(y * vol)
-
-    return augmented
+# Результат:
+# models/wake_word.json  — burn модель (для дообучения)
+# models/wake_word.bin   — бинарные веса для ESP32 (~20 KB)
 ```
-
-100 реальных → 600 аугментированных (×6).
-
----
-
-## Конвертация в TFLite
-
-```python
-# training/convert_tflite.py
-import tensorflow as tf
-
-def convert_to_tflite(keras_model_path, output_path):
-    model = tf.keras.models.load_model(keras_model_path)
-
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-
-    # Оптимизация для размера
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-
-    # Quantization (int8) — для скорости на ESP32
-    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    converter.inference_input_type = tf.int8
-    converter.inference_output_type = tf.int8
-
-    tflite_model = converter.convert()
-
-    with open(output_path, 'wb') as f:
-        f.write(tflite_model)
-
-    print(f"Model size: {len(tflite_model)} bytes")
-    # ~10-30 KB после quantization
-```
-
-### Quantization (int8)
-
-По умолчанию веса — float32 (4 байта). Quantization преобразует в int8 (1 байт) — модель в 4 раза меньше, inference в 3-5 раз быстрее.
-
-Цена: ~1-2% точности. Для wake word — нормально.
 
 ---
 
 ## Дальше
 
-- [04-deploy.md](04-deploy.md) — деплой на ESP32
+- [04-deploy.md](04-deploy.md) — ручной C++ inference на ESP32

@@ -1,79 +1,10 @@
 # Датасет
 
-Сбор и подготовка данных для обучения wake word модели.
+Сбор и подготовка данных на Rust.
 
 ---
 
-## Что нужно собрать
-
-| Категория | Что | Кол-во | Длительность |
-|-----------|-----|--------|--------------|
-| Позитивные | слово "гермес" | 500-2000 | 1 сек каждая |
-| Негативные | другие слова, фразы, шум | 2000-5000 | 1-3 сек |
-| Фон | тишина, музыка, улица | 500 | 1-3 сек |
-
----
-
-## Сбор позитивных ("гермес")
-
-### Способ 1: Записать самому
-
-```bash
-# Скрипт записи (Python, на ноутбуке)
-# recording/record_positives.py
-python record_positives.py --word "гермес" --count 500 --output dataset/positive/
-```
-
-Скрипт:
-1. Показывает "Запись 1/500"
-2. Ты говоришь "гермес"
-3. Запись 1 сек → сохраняет `positive/germes_001.wav`
-4. Пауза 2 сек
-5. Повтор
-
-500 записей × 3 сек цикл = ~25 минут.
-
-### Способ 2: Аугментация (из 100 → 1000)
-
-Из 100 реальных записей生成 1000 через аугментацию:
-
-```python
-augmentations = [
-    pitch_shift(±2 полутона),      # выше/ниже
-    time_stretch(0.8x ... 1.2x),   # быстрее/медленнее
-    add_noise(SNR 5-20 dB),        # фоновый шум
-    volume(0.5x ... 1.5x),         # тише/громче
-    shift(±100мс),                 # сдвиг по времени
-]
-```
-
-100 записей × 10 аугментаций = 1000 позитивных.
-
-### Способ 3: Синтетические (TTS)
-
-Генерируем "гермес" через Edge TTS разными голосами:
-
-```python
-voices = ["ru-RU-SvetlanaNeural", "ru-RU-DmitriNeural", ...]
-for voice in voices:
-    for speed in [0.8, 0.9, 1.0, 1.1, 1.2]:
-        tts.generate("гермес", voice=voice, speed=speed)
-```
-
-Быстро, но менее реалистично. Хорошо для дополнения к реальным записям.
-
----
-
-## Сбор негативных
-
-### Источники:
-
-1. **Google Speech Commands Dataset** — 35 слов, ~100k записей. Бесплатно. Слова типа "yes", "no", "stop" — не "гермес", но речь.
-2. **Common Voice (Mozilla)** — русская речь, тысячи фраз.
-3. **Шум:** recordings of music, street, office, wind, typing.
-4. **Похожие слова:** "германий", "серьёзно", "Герма", "героизм" — чтобы модель училась отличать.
-
-### Структура папок:
+## Структура
 
 ```
 dataset/
@@ -87,97 +18,245 @@ dataset/
 │   └── ...
 └── background/        # тишина, музыка, улица
     ├── silence_001.wav
-    ├── street_001.wav
     └── ...
 ```
 
 ---
 
-## Подготовка (preprocessing)
+## Запись позитивных ("гермес")
 
-Все аудио приводим к единому формату:
+Скрипт на Rust записывает с микрофона:
 
-```python
-# preprocessing.py
-import librosa
-import soundfile as sf
+```rust
+// training/src/record.rs
+use hound::{WavWriter, WavSpec};
+use cpal::{Stream, StreamConfig};
 
-def preprocess(input_path, output_path):
-    y, sr = librosa.load(input_path, sr=16000, mono=True)
-    
-    # Нормализация громкости
-    y = y / max(abs(y)) * 0.9
-    
-    # Обрезка/дополнение до 1 сек (16000 сэмплов)
-    if len(y) > 16000:
-        y = y[:16000]
-    elif len(y) < 16000:
-        y = np.pad(y, (0, 16000 - len(y)))
-    
-    sf.write(output_path, y, 16000)
+fn record_word(output_dir: &str, count: u32) {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    for i in 1..=count {
+        println!("Запись {}/{} — скажи \"гермес\"", i, count);
+        
+        // Запись 1 сек
+        let filename = format!("{}/germes_{:03}.wav", output_dir, i);
+        let mut writer = WavWriter::create(&filename, spec).unwrap();
+        
+        // cpal захват аудио → writer.write_sample()
+        // ...
+        
+        println!("Сохранено: {}", filename);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+```
+
+### Аугментация на Rust
+
+Из 100 реальных → 1000 аугментированных:
+
+```rust
+// training/src/augment.rs
+use rustfft::{FftPlanner, num_complex::Complex};
+
+pub fn augment(samples: &[f32], sr: u32) -> Vec<Vec<f32>> {
+    let mut result = Vec::new();
+
+    // Pitch shift через FFT
+    for shift in [-2.0, 2.0] {
+        result.push(pitch_shift(samples, sr, shift));
+    }
+
+    // Time stretch
+    for rate in [0.9, 1.1] {
+        result.push(time_stretch(samples, rate));
+    }
+
+    // Добавить шум
+    for snr_db in [10.0, 20.0] {
+        let noise: Vec<f32> = (0..samples.len())
+            .map(|_| {
+                let n = rand::random::<f32>() * 2.0 - 1.0;
+                n * 0.01 * 10.0_f32.powf(-snr_db / 20.0)
+            })
+            .collect();
+        result.push(samples.iter().zip(noise.iter()).map(|(s, n)| s + n).collect());
+    }
+
+    // Громкость
+    for vol in [0.7, 1.3] {
+        result.push(samples.iter().map(|s| s * vol).collect());
+    }
+
+    result
+}
 ```
 
 ---
 
-## Извлечение MFCC
+## Негативные
 
-Преобразуем WAV в MFCC матрицы для обучения:
+Источники:
+- **Google Speech Commands** — 35 слов, ~100k записей (скачать WAV)
+- **Похожие слова:** "германий", "серьёзно", "героизм" — чтобы модель отличала
+- **Шум:** музыка, улица, офис (записать или скачать)
 
-```python
-# extract_features.py
-import librosa
-import numpy as np
+---
 
-def wav_to_mfcc(wav_path):
-    y, sr = librosa.load(wav_path, sr=16000)
-    
-    mfcc = librosa.feature.mfcc(
-        y=y, sr=sr,
-        n_mfcc=20,           # 20 коэффициентов
-        n_fft=512,           # размер FFT окна
-        hop_length=480,      # шаг (30мс при 16kHz)
-        win_length=480,      # размер окна (30мс)
-    )
-    
-    # Транспонируем: [time × mfcc] → [33 × 20]
-    mfcc = mfcc.T
-    
-    # Нормализация
-    mfcc = (mfcc - mfcc.mean()) / (mfcc.std() + 1e-8)
-    
-    return mfcc  # shape: (33, 20)
+## Preprocessing
+
+Все WAV → единый формат (16kHz, mono, 1 сек):
+
+```rust
+// training/src/preprocess.rs
+use hound::{WavReader, WavSpec, WavWriter};
+
+pub fn preprocess(input: &str, output: &str) {
+    let mut reader = WavReader::open(input).unwrap();
+    let spec = reader.spec();
+
+    // Декодируем в f32
+    let samples: Vec<f32> = reader.samples::<i16>()
+        .filter_map(|s| s.ok())
+        .map(|s| s as f32 / 32768.0)
+        .collect();
+
+    // Нормализация громкости
+    let max = samples.iter().cloned().fold(0.0f32, f32::max).abs();
+    let normalized: Vec<f32> = samples.iter().map(|s| s / max * 0.9).collect();
+
+    // Обрезка/пад до 16000 сэмплов (1 сек)
+    let mut padded = vec![0.0f32; 16000];
+    let len = normalized.len().min(16000);
+    padded[..len].copy_from_slice(&normalized[..len]);
+
+    // Запись
+    let out_spec = WavSpec {
+        channels: 1, sample_rate: 16000,
+        bits_per_sample: 16, sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(output, out_spec).unwrap();
+    for s in &padded {
+        writer.write_sample((*s * 32767.0) as i16).unwrap();
+    }
+}
 ```
 
-### Размер:
+---
 
-- 1 сек аудио → 33 окна × 20 MFCC = матрица [33 × 20]
-- Это вход нейросети
+## MFCC извлечение на Rust
+
+```rust
+// training/src/mfcc.rs
+use rustfft::{FftPlanner, num_complex::Complex};
+
+pub const N_MFCC: usize = 20;
+pub const FRAME_SIZE: usize = 480;  // 30мс при 16kHz
+pub const HOP_SIZE: usize = 480;
+pub const FFT_SIZE: usize = 512;
+pub const NUM_FRAMES: usize = 33;
+
+pub fn wav_to_mfcc(samples: &[f32], sr: u32) -> [[f32; N_MFCC]; NUM_FRAMES] {
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(FFT_SIZE);
+
+    // Hamming window
+    let hamming: Vec<f32> = (0..FRAME_SIZE)
+        .map(|i| 0.54 - 0.46 * (2.0 * std::f32::consts::PI * i as f32 / (FRAME_SIZE - 1) as f32).cos())
+        .collect();
+
+    // Mel filterbank (предрассчитан)
+    let mel_filters = compute_mel_filterbank();  // [N_MFCC][FFT_SIZE/2]
+
+    // DCT matrix (предрассчитана)
+    let dct_matrix = compute_dct_matrix();  // [N_MFCC][N_MFCC]
+
+    let mut mfcc = [[0.0f32; N_MFCC]; NUM_FRAMES];
+
+    for frame in 0..NUM_FRAMES {
+        let start = frame * HOP_SIZE;
+
+        // 1. Pre-emphasis + Hamming
+        let mut windowed = vec![Complex::new(0.0, 0.0); FFT_SIZE];
+        for i in 0..FRAME_SIZE.min(samples.len() - start) {
+            windowed[i] = Complex::new(samples[start + i] * hamming[i], 0.0);
+        }
+
+        // 2. FFT → спектр мощности
+        fft.process(&mut windowed);
+        let power: Vec<f32> = windowed[..FFT_SIZE/2]
+            .iter()
+            .map(|c| c.norm_sqr())
+            .collect();
+
+        // 3. Mel filterbank → 20 полос
+        let mut mel_energy = [0.0f32; N_MFCC];
+        for m in 0..N_MFCC {
+            for k in 0..FFT_SIZE/2 {
+                mel_energy[m] += mel_filters[m][k] * power[k];
+            }
+        }
+
+        // 4. Log
+        for m in 0..N_MFCC {
+            mel_energy[m] = (mel_energy[m] + 1e-8).ln();
+        }
+
+        // 5. DCT → MFCC
+        for m in 0..N_MFCC {
+            for k in 0..N_MFCC {
+                mfcc[frame][m] += dct_matrix[m][k] * mel_energy[k];
+            }
+        }
+    }
+
+    // 6. Нормализация (mean=0, std=1)
+    let mean: f32 = mfcc.iter().flat_map(|r| r.iter()).sum::<f32>()
+        / (NUM_FRAMES * N_MFCC) as f32;
+    let std = (mfcc.iter().flat_map(|r| r.iter())
+        .map(|v| (v - mean).powi(2)).sum::<f32>()
+        / (NUM_FRAMES * N_MFCC) as f32).sqrt() + 1e-8;
+
+    for frame in 0..NUM_FRAMES {
+        for m in 0..N_MFCC {
+            mfcc[frame][m] = (mfcc[frame][m] - mean) / std;
+        }
+    }
+
+    mfcc
+}
+```
 
 ---
 
 ## Разделение датасета
 
-```
-Всего: 3000 записей (1000 позитивных + 2000 негативных)
+```rust
+// 70% train, 15% val, 15% test
+fn split_dataset(data: Vec<(Matrix, f32)>) -> (Vec<_>, Vec<_>, Vec<_>) {
+    let mut rng = rand::thread_rng();
+    let mut shuffled = data;
+    shuffled.shuffle(&mut rng);
 
-Train:      70%  (2100) — обучение
-Validation: 15%  (450)  — контроль during training
-Test:       15%  (450)  — финальная проверка
-```
+    let n = shuffled.len();
+    let train_end = (n as f32 * 0.7) as usize;
+    let val_end = (n as f32 * 0.85) as usize;
 
-```python
-from sklearn.model_selection import train_test_split
+    let train = shuffled[..train_end].to_vec();
+    let val = shuffled[train_end..val_end].to_vec();
+    let test = shuffled[val_end..].to_vec();
 
-X_train, X_test, y_train, y_test = train_test_split(
-    mfccs, labels, test_size=0.3, random_state=42, stratify=labels
-)
-X_val, X_test, y_val, y_test = train_test_split(
-    X_test, y_test, test_size=0.5, random_state=42, stratify=y_test
-)
+    (train, val, test)
+}
 ```
 
 ---
 
 ## Дальше
 
-- [03-training.md](03-training.md) — обучаем модель на этом датасете
+- [03-training.md](03-training.md) — обучаем на burn

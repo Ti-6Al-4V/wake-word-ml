@@ -1,6 +1,6 @@
 # Интеграция в CapAI
 
-Готовая модель + inference код → firmware CapAI.
+Готовые веса + C++ inference код → firmware CapAI.
 
 ---
 
@@ -8,9 +8,9 @@
 
 ```
 wake-word-ml/
-├── esp32/mfcc.h           → cap-ai/firmware/src/mfcc.h
-├── esp32/inference.h      → cap-ai/firmware/src/wake_word.h
-└── models/wake_word.tflite → cap-ai/firmware/data/wake_word.tflite
+├── esp32/mfcc.h               → cap-ai/firmware/src/mfcc.h
+├── esp32/wake_word_inference.h → cap-ai/firmware/src/wake_word.h
+└── models/wake_word.bin        → cap-ai/firmware/data/wake_word_weights.h (через xxd -i)
 ```
 
 ---
@@ -20,11 +20,19 @@ wake-word-ml/
 ### platformio.ini
 
 ```ini
+[env:xiao_esp32s3]
+platform = espressif32
+board = seeed_xiao_esp32s3
+framework = arduino
+board_build.arduino.memory_type = qspi_opi
+monitor_speed = 115200
+
 lib_deps =
     espressif/esp32-camera
-    tensorflow-lite-micro-esp32    # добавляется
     bblanchon/ArduinoJson
     linksai/ArduinoWebsockets
+    ; НЕТ tensorflow — ручной inference
+    ; НЕТ esp-sr — своя модель
 
 build_flags =
     -DCORE_DEBUG_LEVEL=3
@@ -33,76 +41,70 @@ build_flags =
     -DARDUINO_USB_MODE=1
 ```
 
-ESP-SR (WakeNet) убирается — заменяется на свою модель.
-
 ### config.h
 
 ```cpp
 #define WAKE_THRESHOLD  0.7
 #define MFCC_NUM        20
 #define NUM_FRAMES      33
-#define FRAME_SIZE      480
-#define HOP_SIZE        480
+#define FRAME_SIZE      480   // 30мс при 16kHz
 ```
 
 ### main.cpp
 
 ```cpp
-#include "wake_word.h"  // вместо wakenet.h
+#include "mfcc.h"
+#include "wake_word.h"  // ручной CNN inference
 
-// Core 1: wake word detection (своя модель)
 TaskHandle_t wake_task_handle;
 
 void wake_word_task(void* param) {
-    WakeWordDetector detector;
-    detector.init();
-    // ... цикл из 04-deploy.md
+    float mfcc[NUM_FRAMES][MFCC_NUM];
+    int frame_idx = 0;
+    int16_t pcm[FRAME_SIZE];
+
+    while (true) {
+        size_t n;
+        i2s_read(I2S_MIC_PORT, pcm, FRAME_SIZE * 2, &n, portMAX_DELAY);
+        compute_mfcc_frame(pcm, mfcc[frame_idx]);
+        frame_idx = (frame_idx + 1) % NUM_FRAMES;
+
+        if (frame_idx % 10 == 0) {
+            float score = wake_word_forward(mfcc);
+            if (score > WAKE_THRESHOLD) {
+                xTaskNotifyGive(main_task_handle);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
 }
 
 void setup() {
     // ...
-    xTaskCreatePinnedToCore(
-        wake_word_task, "wake", 8192, NULL, 1, &wake_task_handle, 1
-    );
+    xTaskCreatePinnedToCore(wake_word_task, "wake", 8192, NULL, 1, &wake_task_handle, 1);
 }
 ```
 
 ### State machine (без изменений)
 
 ```
-LIGHT_SLEEP + wake word task (Core 1)
-    │ wake word detected (score > threshold)
+LIGHT_SLEEP + wake_word_task (Core 1)
+    │ score > 0.7
     ▼
-WAKING_UP (WiFi, WS connect) — Core 0
+WAKING_UP → LISTENING → CAPTURING → RESPONDING → TEARDOWN
     ▼
-LISTENING → CAPTURING → RESPONDING → TEARDOWN
-    ▼
-LIGHT_SLEEP + wake word task снова
+LIGHT_SLEEP + wake_word_task снова
 ```
-
----
-
-## Сравнение: ESP-SR WakeNet vs своя модель
-
-| | WakeNet (Espressif) | Своя TFLite |
-|---|---|---|
-| Модель | .wn9 (проприетарный формат) | .tflite (открытый) |
-| Обучение | сервис Espressif (1-2 нед) | сами (~1 день) |
-| Размер | ~500 KB | ~10-30 KB |
-| Inference | ~30мс | ~20-30мс |
-| Потребление | ~40 mA | ~35-45 mA |
-| Точность | ~95% | ~90-93% |
-| Кастомизация | ограничена | полная |
-| Зависимости | ESP-SR библиотека | TFLite Micro |
 
 ---
 
 ## План работы
 
 1. Компоненты CapAI пришли → собираем, тестируем модули
-2. Параллельно: собираем датасет "гермес" (этот репо)
-3. Обучаем модель (~1 день на GPU/CPU)
-4. Конвертируем в .tflite (int8 quantized)
-5. Тест inference на ESP32 (с моделью в Flash)
-6. Интегрируем в CapAI firmware
-7. Тест на кепке: говорим "гермес" → просыпается
+2. Параллельно: собираем датасет "гермес" (Rust скрипт записи)
+3. Обучаем модель на burn (~30 мин на CPU, меньше на GPU)
+4. Экспорт весов: `cargo run --bin export` → `wake_word.bin`
+5. Конвертация: `xxd -i wake_word.bin > wake_word_weights.h`
+6. Тест inference на ESP32 (forward pass, замер скорости)
+7. Интеграция в CapAI firmware
+8. Тест на кепке: говорим "гермес" → просыпается
