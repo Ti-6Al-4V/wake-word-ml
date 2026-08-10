@@ -108,3 +108,6 @@ LIGHT_SLEEP + wake_word_task снова
 6. Тест inference на ESP32 (forward pass, замер скорости)
 7. Интеграция в CapAI firmware
 8. Тест на кепке: говорим "гермес" → просыпается
+
+Критерии готовности и метрики (false accepts/hour, тестовые наборы) —
+в [07-quality.md](07-quality.md). Без них пункт 8 будет работать только дома в тишине.

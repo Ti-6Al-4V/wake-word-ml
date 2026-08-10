@@ -35,6 +35,27 @@
 | [docs/03-training.md](docs/03-training.md) | Обучение модели на burn |
 | [docs/04-deploy.md](docs/04-deploy.md) | Экспорт весов, ручной C++ inference на ESP32 |
 | [docs/05-integration.md](docs/05-integration.md) | Интеграция в CapAI |
+| [docs/06-landscape.md](docs/06-landscape.md) | Как устроены голосовые агенты; обзор Porcupine/openWakeWord/microWakeWord/esp-sr; почему русского готового решения нет |
+| [docs/07-quality.md](docs/07-quality.md) | Как сделать рабочую модель: данные, метрики (false accepts/hour), стриминг, план фаз |
+
+## Почему своя модель, а не готовый движок
+
+Готовых wake word движков много (Porcupine, openWakeWord, microWakeWord,
+esp-sr WakeNet), но кастомное **русское** слово на ESP32 не обучает ни один:
+
+- **Porcupine** удалил поддержку русского из консоли (июнь 2025,
+  issue #1429). Легаси-библиотека `Porcupine_RU` на PlatformIO осталась,
+  но новые русские слова в ней обучить нельзя.
+- **openWakeWord** — только английский, не для Cortex-M.
+- **esp-sr WakeNet** — русский в TTS-пайплайне только "planned" (2026).
+- **microWakeWord** — теоретически возможно через Piper RU голоса,
+  но early release и обучение заявлено как сложное.
+
+Своя модель = единственный полностью контролируемый путь + цель проекта
+"понять как работает под капотом". Методология качества (много TTS-голосов,
+ambient-негативы, метрика ложных тревог в час) взята из практики этих
+движков — см. [docs/06-landscape.md](docs/06-landscape.md) и
+[docs/07-quality.md](docs/07-quality.md).
 
 ## Пайплайн
 
