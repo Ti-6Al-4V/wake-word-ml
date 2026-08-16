@@ -1,0 +1,13 @@
+[package]
+name = "wake-word-ml"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+burn = { version = "0.21", features = ["train", "wgpu"] }
+hound = "3.5"
+rustfft = "6.4"
+cpal = "0.18"
+rand = "0.10"
+rand_chacha = "0.10"
+serde = { version = "1", features = ["derive"] }

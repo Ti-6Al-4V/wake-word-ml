@@ -16,6 +16,9 @@ dataset/
 .vscode/
 .idea/
 
+# Rust
+target/
+
 # OS
 .DS_Store
 Thumbs.db
