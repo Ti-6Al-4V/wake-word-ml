@@ -1,4 +1,4 @@
-.PHONY: generate_tts record check preprocess augment negatives clone_sample
+.PHONY: generate_tts record check preprocess augment negatives clone_sample download-data
 
 # Число дублей за сессию записи (по умолчанию 20).
 # Переопределяется: make record N=50
@@ -31,6 +31,19 @@ preprocess:
 # Аугментация позитивов (8 вариантов на файл, идемпотентно)
 augment:
 	cargo run --bin augment -- dataset/positive dataset/positive
+
+# Скачивание исходников негативов (~3.5GB): Speech Commands + зеркало Golos.
+# Возобновляемое (curl -C -): после обрыва просто перезапустить.
+# Запускать ПЕРЕД make negatives.
+download-data:
+	mkdir -p dataset/raw/downloads dataset/raw/speech_commands
+	curl -L -C - -o dataset/raw/downloads/speech_commands_v0.02.tar.gz \
+		"https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_v0.02.tar.gz"
+	tar -xzf dataset/raw/downloads/speech_commands_v0.02.tar.gz -C dataset/raw/speech_commands
+	for i in 0 1 2; do \
+		curl -sSL -C - -o dataset/raw/downloads/golos_test_$$i.parquet \
+			"https://huggingface.co/datasets/bonlime/golos-test/resolve/main/crowd/test-0000$$i-of-00003.parquet"; \
+	done
 
 # Полный пайплайн негативов: выборка Speech Commands + нарезка Golos + preprocess
 negatives:

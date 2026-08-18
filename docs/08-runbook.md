@@ -20,7 +20,8 @@
  0    Окружение и микрофон         brew/uv/rustup
  1    TTS-позитивы                 make generate_tts
  2    Позитивы своим голосом       make record N=50 → make check
- 3    Негативы                     make negatives
+ 3a   Негативы: скачать            make download-data (~3.5GB)
+ 3b   Негативы: собрать            make negatives
  4    Препроцессинг к 16kHz/1.2с   make preprocess IN=... OUT=...
  5    Аугментация позитивов        make augment
  6    Обучение CNN (burn)          cargo run --bin train
@@ -110,26 +111,59 @@ QC-критерии (`make check`): пик 0.10–0.99, максимум до 93
 Что: 6000 негативов + 6 фоновых шумов. Зачем: главная метрика
 (false accepts ≤1/10ч) тренируется именно на них.
 
+### Источники и прямые ссылки
+
+| Источник | Прямая ссылка | Что это |
+|----------|---------------|---------|
+| Speech Commands v0.02 (Google), 2.3GB | `https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_v0.02.tar.gz` | 105 829 клипов, 35 коротких английских слов |
+| Golos (Сбер) — зеркало, ~1.2GB | `https://huggingface.co/datasets/bonlime/golos-test` → файлы `crowd/test-00000..00002-of-00003.parquet` | test-подмножество: живая русская речь (фразы голосовых ассистентов) |
+
+Официальные площадки Golos — github.com/sberdevices/Golos и
+openslr.org/114 — ведут на файловые ссылки `sc.link`, которые **мертвы**
+(отдают пустой ответ). Зеркало на HuggingFace проверено и используется.
+Аудио внутри parquet — уже готовый WAV 16kHz моно (схема: id,
+audio{bytes,path}, text, duration).
+
+### Пошагово
+
 ```bash
-make negatives
+make download-data   # качает оба источника (~3.5GB), возобновляемо
+make negatives       # выборка + нарезка + preprocess
 ```
 
-Внутри:
-1. **Speech Commands v0.02** — скачан в `dataset/raw/speech_commands`
-   (105k клипов, ~2.3GB). `scripts/sample_speech_commands.py` берёт
-   выборку 2000 (сид 42 — воспроизводимо) в `dataset/raw/sc_sample`
-   и копирует 6 записей фоновых шумов в `dataset/raw/background`.
-2. **Golos** — живая русская речь, самый ценный негатив.
-   `scripts/extract_golos.py` режет фразы на окна 1.2с (тишину
-   отбрасывает по RMS) в `dataset/raw/golos_clips`, лимит 4000.
+Что делает `make negatives` внутри:
+1. `sample_speech_commands.py` (сид 42): из 105k клипов SC выбирает
+   2000 случайных → `raw/sc_sample/`, плюс копирует 6 длинных фоновых
+   шумов из `_background_noise_` → `raw/background/`
+2. `extract_golos.py` (нужен `uv`, он сам подтянет pyarrow): читает
+   фразы из parquet, режет каждую на окна 1.2с без перекрытия,
+   отбрасывает тишину (RMS < 0.01), останавливается на 4000 клипов
+   → `raw/golos_clips/`
+3. preprocess: `sc_sample` и `golos_clips` → `dataset/negative/`
 
-⚠️ **Официальные ссылки Golos (sc.link) мертвы** — отдают пустой
-ответ. Рабочее зеркало: HuggingFace `bonlime/golos-test`, папка
-`crowd/`, 3 parquet по ~430MB. Аудио внутри parquet — уже WAV 16kHz
-моно (схема: id, audio{bytes,path}, text, duration). Скрипт читает их
-через `uv run --with pyarrow`.
+### Принципы — почему именно так
 
-Ambient 10 часов (подкасты/музыка/улица) для теста FA/час — **не**
+- **Golos — самый ценный негатив**: живая русская речь, тот же язык,
+  что модель встретит в жизни. Фразы-команды («афина, включи музыку»)
+  структурно близки к wake-word фразам — идеальные «соседи» границы.
+- **SC — общее разнообразие**: модель не должна реагировать на ЛЮБОЙ
+  короткий звук такой же структуры, не только на русский.
+- **Окна 1.2с без перекрытия** — тот же формат, что у позитивов.
+  Перекрытие дало бы почти идентичные сэмплы и утечку в оценке.
+- **Тишина отбрасывается по RMS**: паузы между фразами после
+  нормализации превратились бы в громкий шум без содержания.
+- **Сид 42** — выборка воспроизводима: при любой пересборке негативы
+  будут теми же.
+- **Объёмы 4000+2000**: баланс к позитивам ~1:2, здоровая вилка для
+  wake word (подробнее в [09-dataset-sizing](09-dataset-sizing.md)).
+
+### Что получается в dataset/negative/
+
+6000 файлов в едином формате (16kHz, моно, 1.2с, пик 0.9):
+- `golos_00001.wav` … `golos_04000.wav` — нарезка Golos
+- `negative_sc_00001.wav` … `negative_sc_02000.wav` — выборка SC
+
+Ambient 10 часов (подкасты/музыка/улица) для теста FA/час пока **не**
 скачаны и в train не входят никогда (07-quality §4).
 
 ## Этап 4 — препроцессинг ✅
