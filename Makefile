@@ -1,4 +1,4 @@
-.PHONY: generate_tts record check preprocess augment negatives clone_sample download-data mfcc-check split-check
+.PHONY: generate_tts record check preprocess augment negatives clone_sample download-data mfcc-check split-check train
 
 # Число дублей за сессию записи (по умолчанию 20).
 # Переопределяется: make record N=50
@@ -32,6 +32,10 @@ mfcc-check:
 # Размеры и баланс сплитов + проверка отсутствия утечки данных
 split-check:
 	cargo run --bin split_check
+
+# Обучение CNN: make train [E=10] [BATCH=64] [LR=0.001]
+train:
+	cargo run --release --bin train -- $(or $(E),10) $(or $(BATCH),64) $(or $(LR),0.001)
 
 # Препроцессинг любой папки: make preprocess IN=dataset/raw/real OUT=dataset/positive
 preprocess:

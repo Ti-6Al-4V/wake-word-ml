@@ -11,6 +11,8 @@ dataset/
 # Models (коммитим только .tflite, не .keras)
 *.keras
 *.h5
+# Обученные веса — артефакт эксперимента, воспроизводится через make train
+models/
 
 # IDE
 .vscode/
