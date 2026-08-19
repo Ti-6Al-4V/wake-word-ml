@@ -1,4 +1,4 @@
-.PHONY: generate_tts record check preprocess augment negatives clone_sample download-data
+.PHONY: generate_tts record check preprocess augment negatives clone_sample download-data mfcc-check
 
 # Число дублей за сессию записи (по умолчанию 20).
 # Переопределяется: make record N=50
@@ -23,6 +23,11 @@ clone_sample:
 # Проверка записанных дублей: уровень, попадание слова в окно.
 check:
 	python3 scripts/qc.py dataset/raw/real
+
+# Посмотреть MFCC-признаки файла «глазами модели»:
+# make mfcc-check FILE=dataset/positive/germes_real_0020.wav
+mfcc-check:
+	cargo run --bin mfcc_check -- $(FILE)
 
 # Препроцессинг любой папки: make preprocess IN=dataset/raw/real OUT=dataset/positive
 preprocess:
