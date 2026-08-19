@@ -1,4 +1,4 @@
-.PHONY: generate_tts record check preprocess augment negatives clone_sample download-data mfcc-check
+.PHONY: generate_tts record check preprocess augment negatives clone_sample download-data mfcc-check split-check
 
 # Число дублей за сессию записи (по умолчанию 20).
 # Переопределяется: make record N=50
@@ -28,6 +28,10 @@ check:
 # make mfcc-check FILE=dataset/positive/germes_real_0020.wav
 mfcc-check:
 	cargo run --bin mfcc_check -- $(FILE)
+
+# Размеры и баланс сплитов + проверка отсутствия утечки данных
+split-check:
+	cargo run --bin split_check
 
 # Препроцессинг любой папки: make preprocess IN=dataset/raw/real OUT=dataset/positive
 preprocess:
