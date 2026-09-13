@@ -1,5 +1,9 @@
 # Интеграция в CapAI
 
+> Обновлено 2026-09-13: 40 кадров, стриминг с шагом 100мс и
+> подтверждением (см. [04-deploy](04-deploy.md)). Прежний вариант
+> с 33 кадрами и проверкой раз в 10 кадров устарел.
+
 Готовые веса + C++ inference код → firmware CapAI.
 
 ---
@@ -8,9 +12,9 @@
 
 ```
 wake-word-ml/
-├── esp32/mfcc.h               → cap-ai/firmware/src/mfcc.h
-├── esp32/wake_word_inference.h → cap-ai/firmware/src/wake_word.h
-└── models/wake_word.bin        → cap-ai/firmware/data/wake_word_weights.h (через xxd -i)
+├── esp32/mfcc.h                → cap-ai/firmware/src/mfcc.h
+├── esp32/hermes_inference.h    → cap-ai/firmware/src/hermes_inference.h
+└── models/hermes.export.bin    → cap-ai/firmware/src/hermes_weights.h (генератор в export.rs)
 ```
 
 ---
@@ -44,52 +48,59 @@ build_flags =
 ### config.h
 
 ```cpp
-#define WAKE_THRESHOLD  0.7
-#define MFCC_NUM        20
-#define NUM_FRAMES      33
-#define FRAME_SIZE      480   // 30мс при 16kHz
+#define WAKE_THRESHOLD  0.85f   // из кривой make eval, НЕ 0.5
+#define N_MFCC          20
+#define NUM_FRAMES      40      // 1.2с при кадре 30мс
+#define FRAME_SIZE      480     // 30мс при 16kHz
+#define HOP_SAMPLES     1600    // шаг стриминга 100мс
+#define WAKE_CONFIRM    2       // окон подряд выше порога
+#define WAKE_COOLDOWN   20      // шагов по 100мс = 2с
+#define NOISE_FLOOR     0.005f  // RMS ниже — CNN не считаем
 ```
 
 ### main.cpp
 
 ```cpp
 #include "mfcc.h"
-#include "wake_word.h"  // ручной CNN inference
+#include "hermes_inference.h"
 
 TaskHandle_t wake_task_handle;
 
 void wake_word_task(void* param) {
-    float mfcc[NUM_FRAMES][MFCC_NUM];
-    int frame_idx = 0;
-    int16_t pcm[FRAME_SIZE];
+    static int16_t ring[NUM_FRAMES * FRAME_SIZE];   // 19200 сэмплов = 1.2с
+    static float mfcc[NUM_FRAMES][N_MFCC];
+    int hits = 0, cooldown = 0;
 
     while (true) {
-        size_t n;
-        i2s_read(I2S_MIC_PORT, pcm, FRAME_SIZE * 2, &n, portMAX_DELAY);
-        compute_mfcc_frame(pcm, mfcc[frame_idx]);
-        frame_idx = (frame_idx + 1) % NUM_FRAMES;
+        i2s_read_into_ring(ring, HOP_SAMPLES);       // блокируется на 100мс аудио
+        if (cooldown > 0) { cooldown--; hits = 0; continue; }
+        if (ring_rms(ring) < NOISE_FLOOR) { hits = 0; continue; }
 
-        if (frame_idx % 10 == 0) {
-            float score = wake_word_forward(mfcc);
-            if (score > WAKE_THRESHOLD) {
-                xTaskNotifyGive(main_task_handle);
-            }
+        compute_mfcc(ring, mfcc);                    // тот же алгоритм, что src/mfcc.rs
+        float p = hermes_forward(mfcc);
+        hits = (p > WAKE_THRESHOLD) ? hits + 1 : 0;
+        if (hits >= WAKE_CONFIRM) {
+            xTaskNotifyGive(main_task_handle);
+            cooldown = WAKE_COOLDOWN;
+            hits = 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
 void setup() {
     // ...
-    xTaskCreatePinnedToCore(wake_word_task, "wake", 8192, NULL, 1, &wake_task_handle, 1);
+    xTaskCreatePinnedToCore(wake_word_task, "wake", 16384, NULL, 1, &wake_task_handle, 1);
 }
 ```
+
+Стек задачи 16 KB: буферы свёрток объявлены `static` в
+`hermes_inference.h`, в стек не попадают.
 
 ### State machine (без изменений)
 
 ```
 LIGHT_SLEEP + wake_word_task (Core 1)
-    │ score > 0.7
+    │ 2 окна подряд > WAKE_THRESHOLD
     ▼
 WAKING_UP → LISTENING → CAPTURING → RESPONDING → TEARDOWN
     ▼
@@ -101,13 +112,16 @@ LIGHT_SLEEP + wake_word_task снова
 ## План работы
 
 1. Компоненты CapAI пришли → собираем, тестируем модули
-2. Параллельно: собираем датасет "гермес" (Rust скрипт записи)
-3. Обучаем модель на burn (~30 мин на CPU, меньше на GPU)
-4. Экспорт весов: `cargo run --bin export` → `wake_word.bin`
-5. Конвертация: `xxd -i wake_word.bin > wake_word_weights.h`
-6. Тест inference на ESP32 (forward pass, замер скорости)
-7. Интеграция в CapAI firmware
-8. Тест на кепке: говорим "гермес" → просыпается
+2. Датасет и модель — по [08-runbook](08-runbook.md), этапы 2b–7
+3. `cargo run --bin export` → `hermes.export.bin` + `hermes_weights.h`
+4. **Тест совпадения**: 100 окон из `dataset/` через Rust (`make score`)
+   и через C++ на ESP32 (или на Mac, скомпилировав `hermes_inference.h`
+   обычным `clang`) — вероятности равны до 3 знака. До этого метрики
+   на устройстве не измерять
+5. Тест на кепке дома: говорим «Гермес» → просыпается; молчим/говорим
+   другое → не просыпается. Порог — из `make eval`
+6. Тест на улице; при провале — этап 2 фаза 2 (перезапись позитивов на
+   INMP441) и негативы с улицы
 
 Критерии готовности и метрики (false accepts/hour, тестовые наборы) —
-в [07-quality.md](07-quality.md). Без них пункт 8 будет работать только дома в тишине.
+в [07-quality.md](07-quality.md). Без них пункт 5 будет работать только дома в тишине.

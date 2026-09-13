@@ -1,285 +1,115 @@
-# Обучение модели на burn
+# Обучение и оценка: справочник по коду
 
-[burn](https://github.com/tracel-ai/burn) — Rust ML framework. WGPU/CUDA backend, типобезопасные тензоры.
+> Переписано 2026-09-13 под реальный код (burn 0.21). Прежняя версия
+> описывала проект-план на burn 0.14 с окном 1с и 33 кадрами — она
+> не совпадала с тем, что лежит в `src/`. Учебное объяснение
+> «почему так» — [00-learning-path](00-learning-path.md), шаги 6–8.
+> Здесь — только «что где лежит и как вызывается».
 
 ---
 
-## Cargo.toml
+## Файлы
 
-```toml
-[package]
-name = "wake-word-ml"
-version = "0.1.0"
-edition = "2021"
+| Файл | Что |
+|---|---|
+| `src/model.rs` | `HermesNet` — архитектура, одна для train/eval/export. `sigmoid`, `batch_tensor` |
+| `src/dataset.rs` | сплит 70/15/15 с группировкой по исходнику, `features_flat` |
+| `src/mfcc.rs` | признаки: 40×20, log-пол, CMVN по коэффициенту |
+| `src/bin/train.rs` | ручной цикл обучения, кэш признаков, чекпоинт, CSV-лог |
+| `src/bin/eval.rs` | кривая порогов, score по папке, стриминг FA/час |
+| `src/bin/export.rs` | заглушка (этап 8) |
 
-[dependencies]
-burn = { version = "0.14", features = ["train", "wgpu"] }
-hound = "3.5"
-rustfft = "6.2"
-rand = "0.8"
-serde = { version = "1.0", features = ["derive"] }
+## Модель
 
-[[bin]]
-name = "train"
-path = "src/train.rs"
-
-[[bin]]
-name = "record"
-path = "src/record.rs"
-
-[[bin]]
-name = "export"
-path = "src/export.rs"
+```
+[b, 1, 40, 20]
+ → Conv2d(1→16, 3×3, Valid) → ReLU → MaxPool 2×2   → [b, 16, 19, 9]
+ → Conv2d(16→8, 3×3, Valid) → ReLU → MaxPool 2×2   → [b, 8, 8, 3]
+ → reshape [b, 192] → Dropout(p) → Linear(192→16) → ReLU → Linear(16→1)
+ → reshape [b]  — ЛОГИТ, сигмоида снаружи
 ```
 
----
-
-## Модель на burn
+Параметров 4425. Dropout с p = 0 — тождественный (по умолчанию).
 
 ```rust
-// src/model.rs
-use burn::{
-    nn::{Conv2d, Conv2dConfig, Linear, LinearConfig, Relu, Sigmoid},
-    tensor::{Tensor, backend::AutodiffBackend},
-    module::Module,
-};
-
-#[derive(Module, Debug)]
-pub struct WakeWordModel<B: AutodiffBackend> {
-    conv1: Conv2d<B, 1>,      // 1 канал → 16 фильтров
-    conv2: Conv2d<B, 16>,     // 16 → 8 фильтров
-    fc1: Linear<B>,           // flatten → 16
-    fc2: Linear<B>,           // 16 → 1
-    relu: Relu,
-    sigmoid: Sigmoid,
-}
-
-impl<B: AutodiffBackend> WakeWordModel<B> {
-    pub fn new(device: &B::Device) -> Self {
-        let conv1 = Conv2dConfig::new([1, 16], [3, 3]).with_padding(burn::nn::PaddingConfig2d::Same).init(device);
-        let conv2 = Conv2dConfig::new([16, 8], [3, 3]).with_padding(burn::nn::PaddingConfig2d::Same).init(device);
-
-        // После 2 MaxPool(2,2): [33×20] → [16×10] → [8×5] → flatten = 8*5*8 = 320
-        let fc1 = LinearConfig::new(320, 16).init(device);
-        let fc2 = LinearConfig::new(16, 1).init(device);
-
-        Self {
-            conv1, conv2, fc1, fc2,
-            relu: Relu::new(),
-            sigmoid: Sigmoid::new(),
-        }
-    }
-
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
-        // x: [batch, 1, 33, 20]
-        let x = self.conv1.forward(x);    // [batch, 16, 33, 20]
-        let x = self.relu.forward(x);
-        let x = x.max_pool_2d([2, 2], [2, 2], [0, 0]);  // [batch, 16, 16, 10]
-
-        let x = self.conv2.forward(x);    // [batch, 8, 16, 10]
-        let x = self.relu.forward(x);
-        let x = x.max_pool_2d([2, 2], [2, 2], [0, 0]);  // [batch, 8, 8, 5]
-
-        let x = x.flatten(1, 3);         // [batch, 320]
-        let x = self.fc1.forward(x);     // [batch, 16]
-        let x = self.relu.forward(x);
-        let x = self.fc2.forward(x);     // [batch, 1]
-        let x = self.sigmoid.forward(x); // [batch, 1]
-
-        x.squeeze(1)                     // [batch]
-    }
-}
+let model = HermesNet::<Autodiff<Wgpu>>::new(&device, dropout);
+let logits: Tensor<B, 1> = model.forward(x);   // x: Tensor<B, 4> = [b,1,40,20]
 ```
 
----
+## Цикл обучения (`train.rs`)
 
-## Обучение
+```
+аргументы: [эпохи=10] [батч=64] [lr=0.001] [dropout=0] [weight_decay=0]
+make train E=30 BATCH=64 LR=0.001 DROPOUT=0.2 WD=0.0001
+
+Backend::seed(&device, 42)                    — воспроизводимая инициализация
+splits = dataset::load(positive, negative)    — 70/15/15
+train/val признаки → кэш в памяти             — MFCC один раз
+for epoch:
+    перемешать индексы (сид 42+epoch)
+    for batch:
+        logits = model.forward(x)
+        loss   = BCEWithLogits(logits, y)
+        grads  = GradientsParams::from_grads(loss.backward(), &model)
+        model  = adam.step(lr, model, grads)
+    val: loss, acc, TPR, FA при пороге 0.5 → stdout + models/train_log.csv
+    если val loss лучший → save models/hermes.bin
+save models/hermes_last.bin
+```
+
+Выходы:
+
+| Файл | Что |
+|---|---|
+| `models/hermes.bin` | веса лучшей по val loss эпохи — их читает eval/export |
+| `models/hermes_last.bin` | веса последней эпохи |
+| `models/train_log.csv` | `epoch,train_loss,val_loss,val_acc,val_tpr,val_fa` |
+
+## Оценка (`eval.rs`)
+
+```
+make eval [SPLIT=val|test]      кривая порогов 0.05..0.95: TPR, FA-доля, FN, FP;
+                                самые уверенные ошибки по именам файлов
+make score DIR=<папка> [T=0.5]  гистограмма вероятностей по любым wav 16kHz/1.2с
+make stream FILE=<wav> [HOP=100] скользящее окно по длинной 16kHz-записи:
+                                FA/час при каждом пороге (2 окна подряд, cooldown 2с)
+```
+
+Загрузка модели:
 
 ```rust
-// src/train.rs
-use burn::{
-    config::Config,
-    data::{DataLoaderBuilder, dataset::Dataset},
-    optim::AdamConfig,
-    train::{LearnerBuilder, TrainOutput, TrainStep, ValidStep},
-    tensor::{Tensor, backend::{AutodiffBackend, Backend}},
-};
-
-#[derive(Config)]
-pub struct TrainConfig {
-    #[config(default = 50)]
-    pub epochs: usize,
-    #[config(default = 32)]
-    pub batch_size: usize,
-    #[config(default = 1e-3)]
-    pub learning_rate: f64,
-}
-
-impl<B: AutodiffBackend> TrainStep<(Tensor<B, 4>, Tensor<B, 1>), ClassificationLoss<B>>
-    for WakeWordModel<B>
-{
-    fn step(&self, (input, target): (Tensor<B, 4>, Tensor<B, 1>)) -> TrainOutput<ClassificationLoss<B>> {
-        let prediction = self.forward(input);
-        let loss = binary_cross_entropy(&prediction, &target);
-
-        let gradients = loss.backward();
-
-        TrainOutput::new(self, gradients, ClassificationLoss::new(loss))
-    }
-}
-
-fn binary_cross_entropy<B: Backend>(
-    pred: &Tensor<B, 2>,
-    target: &Tensor<B, 2>,
-) -> Tensor<B, 1> {
-    let eps = 1e-7;
-    let pred_clipped = pred.clone().clamp(eps, 1.0 - eps);
-    let loss = target.clone() * pred_clipped.clone().log()
-        + (1.0 - target.clone()) * (1.0 - pred_clipped).log();
-    -loss.mean()
-}
-
-pub fn train<B: AutodiffBackend>(device: B::Device, config: TrainConfig) {
-    let model = WakeWordModel::new(&device);
-    let optimizer = AdamConfig::new().with_learning_rate(config.learning_rate);
-
-    let train_loader = DataLoaderBuilder::new(batch)
-        .build(WakeWordDataset::train());
-    let val_loader = DataLoaderBuilder::new(batch)
-        .build(WakeWordDataset::val());
-
-    let learner = LearnerBuilder::new("models/")
-        .devices(vec![device.clone()])
-        .num_epochs(config.epochs)
-        .build(model, optimizer, 1e-3);
-
-    let model = learner.fit(train_loader, val_loader);
-
-    // Сохраняем модель
-    model.save("models/wake_word.json").unwrap();
-}
+HermesNet::<Wgpu>::new(&device, 0.0)
+    .load_file("models/hermes", &BinFileRecorder::<FullPrecisionSettings>::new(), &device)
 ```
 
----
+## burn 0.21: что отличается от старых примеров в сети
 
-## Экспорт весов для ESP32
+Большинство туториалов написаны под 0.13–0.14. Что пришлось менять:
 
-После обучения извлекаем веса в бинарный формат для C++:
+| Было (0.14) | Стало (0.21) |
+|---|---|
+| `burn::nn::conv::Conv2d<B, N>` (const N) | `Conv2d<B>` без параметра |
+| `x.max_pool_2d(...)` на тензоре | модуль `MaxPool2dConfig::new([2,2]).init()` |
+| `LinearConfig::new(in, out).init()` | `.init(device)` |
+| `loss.init()` | `BinaryCrossEntropyLossConfig::new().with_logits(true).init::<B>(&device)` |
+| `B::seed(42)` | `B::seed(&device, 42)` |
+| `tensor.to_data().value` | `tensor.into_data().into_vec::<f32>()` |
+| `WgpuDevice::default()` | `WgpuDevice::DefaultDevice` |
+| lr как `f32` | `LearningRate = f64` |
+| `AdamConfig::new().with_learning_rate(lr)` | lr передаётся в `optim.step(lr, model, grads)` |
+| `model.valid()` | то же — `AutodiffModule::valid()` даёт модель на бэкенде без autodiff |
 
-```rust
-// src/export.rs
-use std::io::Write;
+Weight decay: `AdamConfig::new().with_weight_decay(Some(WeightDecayConfig::new(penalty)))`,
+путь `burn::optim::decay::WeightDecayConfig`.
 
-pub fn export_weights(model: &WakeWordModel<CpuBackend>, output: &str) {
-    let mut file = std::fs::File::create(output).unwrap();
+## Целевые метрики
 
-    // Conv1: weights [16, 1, 3, 3] + bias [16]
-    let conv1_weights = model.conv1.weight.to_data();
-    let conv1_bias = model.conv1.bias.to_data();
-    write_tensor(&mut file, &conv1_weights, &[16, 1, 3, 3]);
-    write_tensor(&mut file, &conv1_bias, &[16]);
-
-    // Conv2: weights [8, 16, 3, 3] + bias [8]
-    let conv2_weights = model.conv2.weight.to_data();
-    let conv2_bias = model.conv2.bias.to_data();
-    write_tensor(&mut file, &conv2_weights, &[8, 16, 3, 3]);
-    write_tensor(&mut file, &conv2_bias, &[8]);
-
-    // FC1: weights [320, 16] + bias [16]
-    let fc1_weights = model.fc1.weight.to_data();
-    let fc1_bias = model.fc1.bias.to_data();
-    write_tensor(&mut file, &fc1_weights, &[320, 16]);
-    write_tensor(&mut file, &fc1_bias, &[16]);
-
-    // FC2: weights [16, 1] + bias [1]
-    let fc2_weights = model.fc2.weight.to_data();
-    let fc2_bias = model.fc2.bias.to_data();
-    write_tensor(&mut file, &fc2_weights, &[16, 1]);
-    write_tensor(&mut file, &fc2_bias, &[1]);
-
-    println!("Exported to {} ({} bytes)", output, file.metadata().unwrap().len());
-}
-
-fn write_tensor(file: &mut std::fs::File, data: &TensorData, shape: &[usize]) {
-    // Header: [ndim, dim0, dim1, ...]
-    file.write_all(&(shape.len() as u32).to_le_bytes()).unwrap();
-    for &dim in shape {
-        file.write_all(&(dim as u32).to_le_bytes()).unwrap();
-    }
-    // Data: f32 values
-    for v in data.iter::<f32>() {
-        file.write_all(&v.to_le_bytes()).unwrap();
-    }
-}
-```
-
-Выходной файл: `models/wake_word.bin` (~20 KB).
-
----
-
-## Оценка
-
-```rust
-pub fn evaluate(model: &WakeWordModel<B>, test_data: &[(Matrix, f32)]) {
-    let mut tp = 0; let mut fp = 0;
-    let mut tn = 0; let mut fn_ = 0;
-
-    for (mfcc, label) in test_data {
-        let input = tensor_from_mfcc(mfcc);
-        let score = model.forward(input.unsqueeze());
-        let predicted = score > 0.5;
-
-        match (predicted, *label > 0.5) {
-            (true, true) => tp += 1,
-            (true, false) => fp += 1,
-            (false, true) => fn_ += 1,
-            (false, false) => tn += 1,
-        }
-    }
-
-    let accuracy = (tp + tn) as f32 / test_data.len() as f32;
-    let fpr = fp as f32 / (fp + tn) as f32;
-    let fnr = fn_ as f32 / (fn_ + tp) as f32;
-
-    println!("Accuracy: {:.3}", accuracy);
-    println!("False positive rate: {:.4}", fpr);
-    println!("False negative rate: {:.4}", fnr);
-}
-```
-
-### Целевые метрики
-
-| Метрика | Цель |
-|---------|------|
-| Accuracy | >90% |
-| False positive rate | <3% |
-| False negative rate | <10% |
-| Model size | <25 KB |
-
----
-
-## Запуск
-
-```bash
-# Установка Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Запись датасета (на ноутбуке)
-cargo run --bin record -- --word "гермес" --count 500 --output dataset/positive/
-
-# Обучение
-cargo run --bin train
-
-# Экспорт весов для ESP32
-cargo run --bin export
-
-# Результат:
-# models/wake_word.json  — burn модель (для дообучения)
-# models/wake_word.bin   — бинарные веса для ESP32 (~20 KB)
-```
+Из [07-quality](07-quality.md): TPR ≥ 95% при пороге, дающем
+FA ≤ 1 в 10 часов на ambient-стриминге; 0 срабатываний на двойниках.
+Accuracy не является целью.
 
 ---
 
 ## Дальше
 
-- [04-deploy.md](04-deploy.md) — ручной C++ inference на ESP32
+- [04-deploy.md](04-deploy.md) — экспорт и ручной C++ inference

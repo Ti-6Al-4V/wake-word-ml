@@ -1,265 +1,218 @@
 # Деплой на ESP32-S3
 
-Ручной C++ inference. Никаких рантаймов — модель маленькая, forward pass пишем руками.
+> Обновлено 2026-09-13 под реальную модель: окно 1.2с = 40 кадров,
+> паддинг Valid, flatten 192, логит на выходе, CMVN по коэффициенту.
+> Прежняя версия (33 кадра, Same, 320) не совпадала с `src/model.rs` —
+> по ней C++ не сошёлся бы с Rust по размерностям.
+
+Ручной C++ inference. Никаких рантаймов — модель маленькая, forward pass
+пишем руками.
 
 ---
 
 ## Почему без TFLite
 
-Модель: 2 Conv2D + 2 Dense = ~5000 параметров, ~20 KB. Ручной forward pass ~200 строк C++. Полный контроль, ноль зависимостей.
+Модель: 2 Conv2D + 2 Dense = 4425 параметров, 18 KB float32. Ручной
+forward pass ~200 строк C++. Полный контроль, ноль зависимостей.
 
 ---
 
-## Экспорт из Rust
+## Что должно совпасть с Rust
 
-`models/wake_word.bin` — бинарный файл с весами:
+Первый тест деплоя — не метрики, а **совпадение чисел**: одно и то же
+окно 19200 сэмплов → Rust (`eval score`) и C++ должны дать вероятность,
+равную до 3 знака. Для этого одинаковыми обязаны быть:
+
+1. MFCC: pre-emphasis 0.97, кадр 480 без перекрытия, Хэмминг, FFT 512,
+   20 mel-фильтров 0–8000 Гц (формула `hz_to_bin` из `src/mfcc.rs`),
+   `ln(max(energy, 1e-5))`, DCT-II 20×20, CMVN по каждому коэффициенту
+   (среднее/std по 40 кадрам, `+1e-5` к std).
+2. Порядок весов и раскладка тензоров (ниже).
+3. Паддинг Valid: выход свёртки на 2 меньше входа по каждой оси.
+
+---
+
+## Экспорт из Rust (`export.rs`, этап 8)
+
+`models/hermes.export.bin` — плоский файл с заголовком на тензор:
 
 ```
-[header: ndim + shape] [data: f32 values]
-  Conv1 weights [16, 1, 3, 3]  = 144 f32 + 16 bias = 640 bytes
-  Conv2 weights [8, 16, 3, 3]  = 1152 f32 + 8 bias  = 4640 bytes
-  FC1   weights [320, 16]      = 5120 f32 + 16 bias = 20544 bytes
-  FC2   weights [16, 1]        = 16 f32 + 1 bias    = 68 bytes
-  Итого: ~26 KB
+[u32 ndim][u32 dim0..dimN][f32 × prod(dims)]   ×  8 тензоров по порядку:
+
+  conv1.weight [16, 1, 3, 3]     144 f32
+  conv1.bias   [16]
+  conv2.weight [8, 16, 3, 3]    1152 f32
+  conv2.bias   [8]
+  fc1.weight   [192, 16]        3072 f32   — burn хранит Linear как [in, out]
+  fc1.bias     [16]
+  fc2.weight   [16, 1]            16 f32
+  fc2.bias     [1]
+  Итого 4425 f32 = 17.7 KB
 ```
+
+Внимание на `fc1.weight [in, out]`: burn считает `x · W`, а не `W · x`.
+В C++ ниже индексация под это.
+
+Квантование int8 (после того, как float-версия совпала с Rust):
+per-tensor scale = max|w| / 127, веса → int8, активации остаются float.
+18 KB → 4.4 KB. Прогнать `eval` на квантованной модели и сравнить
+кривую порогов с float — на 4К параметров деградация бывает заметной.
 
 ---
 
 ## Загрузка весов на ESP32
 
 ```cpp
-// wake_word_weights.h
+// hermes_weights.h — сгенерировано из hermes.export.bin
 #pragma once
-#include <pgmspace.h>
-
-// Веса прошиваются во Flash через PROGMEM
-// Сгенерировано из wake_word.bin (xxd -i)
-
-static const float CONV1_WEIGHT[16][1][3][3] PROGMEM = { ... };
-static const float CONV1_BIAS[16] PROGMEM = { ... };
-static const float CONV2_WEIGHT[8][16][3][3] PROGMEM = { ... };
-static const float CONV2_BIAS[8] PROGMEM = { ... };
-static const float FC1_WEIGHT[16][320] PROGMEM = { ... };
-static const float FC1_BIAS[16] PROGMEM = { ... };
-static const float FC2_WEIGHT[1][16] PROGMEM = { ... };
-static const float FC2_BIAS[1] PROGMEM = { ... };
+static const float CONV1_W[16][1][3][3] = { ... };
+static const float CONV1_B[16] = { ... };
+static const float CONV2_W[8][16][3][3] = { ... };
+static const float CONV2_B[8] = { ... };
+static const float FC1_W[192][16] = { ... };   // [in][out], как в burn
+static const float FC1_B[16] = { ... };
+static const float FC2_W[16][1] = { ... };
+static const float FC2_B[1] = { ... };
 ```
 
----
-
-## MFCC на C++ (тот же алгоритм что в Rust)
-
-```cpp
-// mfcc.h — см. docs/04-deploy.md в предыдущей версии
-// FFT → mel filterbank → log → DCT → нормализация
-// Вход: PCM 16000 сэмплов, выход: [33][20] MFCC матрица
-```
+На ESP32-S3 константные массивы и так лежат во flash (rodata); PROGMEM
+не нужен.
 
 ---
 
 ## Ручной CNN Forward Pass
 
 ```cpp
-// wake_word_inference.h
+// hermes_inference.h
 #pragma once
 #include <math.h>
-#include "wake_word_weights.h"
+#include "hermes_weights.h"
 
-#define CONV1_OUT 16
-#define CONV2_OUT 8
-#define FC1_OUT   16
-#define INPUT_H   33
-#define INPUT_W   20
+#define NUM_FRAMES 40
+#define N_MFCC     20
 
-static float relu(float x) { return x > 0 ? x : 0; }
-static float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+static inline float relu(float x) { return x > 0 ? x : 0; }
+static inline float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-// Conv2d + ReLU, padding=same, stride=1
-void conv2d_relu(const float* input, int in_h, int in_w, int in_ch,
-                 const float* weight, const float* bias,
-                 int out_ch, int k_h, int k_w,
-                 float* output) {
-    int out_h = in_h;  // same padding
-    int out_w = in_w;
-    int pad_h = (k_h - 1) / 2;
-    int pad_w = (k_w - 1) / 2;
-
-    for (int oc = 0; oc < out_ch; oc++) {
-        for (int y = 0; y < out_h; y++) {
+// Conv2d + ReLU, padding=VALID, stride=1: out = in - 2 по каждой оси.
+// Раскладка: input[ic][y][x], weight[oc][ic][ky][kx], output[oc][y][x]
+static void conv2d_valid_relu(const float* in, int in_h, int in_w, int in_ch,
+                              const float* w, const float* b, int out_ch,
+                              float* out) {
+    const int out_h = in_h - 2, out_w = in_w - 2;
+    for (int oc = 0; oc < out_ch; oc++)
+        for (int y = 0; y < out_h; y++)
             for (int x = 0; x < out_w; x++) {
-                float sum = bias[oc];
-                for (int ic = 0; ic < in_ch; ic++) {
-                    for (int ky = 0; ky < k_h; ky++) {
-                        for (int kx = 0; kx < k_w; kx++) {
-                            int iy = y + ky - pad_h;
-                            int ix = x + kx - pad_w;
-                            if (iy >= 0 && iy < in_h && ix >= 0 && ix < in_w) {
-                                float in_val = input[ic * in_h * in_w + iy * in_w + ix];
-                                float w_val = weight[oc * in_ch * k_h * k_w
-                                                   + ic * k_h * k_w + ky * k_w + kx];
-                                sum += in_val * w_val;
-                            }
-                        }
-                    }
-                }
-                output[oc * out_h * out_w + y * out_w + x] = relu(sum);
+                float s = b[oc];
+                for (int ic = 0; ic < in_ch; ic++)
+                    for (int ky = 0; ky < 3; ky++)
+                        for (int kx = 0; kx < 3; kx++)
+                            s += in[(ic * in_h + y + ky) * in_w + x + kx]
+                               * w[((oc * in_ch + ic) * 3 + ky) * 3 + kx];
+                out[(oc * out_h + y) * out_w + x] = relu(s);
             }
-        }
-    }
 }
 
-// MaxPool2d 2×2, stride=2
-void maxpool2d(const float* input, int in_h, int in_w, int channels,
-               float* output, int* out_h, int* out_w) {
-    *out_h = in_h / 2;
-    *out_w = in_w / 2;
-    for (int c = 0; c < channels; c++) {
-        for (int y = 0; y < *out_h; y++) {
-            for (int x = 0; x < *out_w; x++) {
-                float max = -1e30;
-                for (int dy = 0; dy < 2; dy++) {
+// MaxPool 2×2, stride 2: нечётный хвост отбрасывается (19→9, 17→8, 7→3).
+static void maxpool2(const float* in, int in_h, int in_w, int ch, float* out) {
+    const int out_h = in_h / 2, out_w = in_w / 2;
+    for (int c = 0; c < ch; c++)
+        for (int y = 0; y < out_h; y++)
+            for (int x = 0; x < out_w; x++) {
+                float m = -1e30f;
+                for (int dy = 0; dy < 2; dy++)
                     for (int dx = 0; dx < 2; dx++) {
-                        int iy = y * 2 + dy;
-                        int ix = x * 2 + dx;
-                        float v = input[c * in_h * in_w + iy * in_w + ix];
-                        if (v > max) max = v;
+                        float v = in[(c * in_h + 2 * y + dy) * in_w + 2 * x + dx];
+                        if (v > m) m = v;
                     }
-                }
-                output[c * (*out_h) * (*out_w) + y * (*out_w) + x] = max;
+                out[(c * out_h + y) * out_w + x] = m;
             }
-        }
-    }
 }
 
-// Dense + ReLU
-void dense_relu(const float* input, int in_size,
-                const float* weight, const float* bias,
-                int out_size, float* output) {
-    for (int o = 0; o < out_size; o++) {
-        float sum = bias[o];
-        for (int i = 0; i < in_size; i++) {
-            sum += input[i] * weight[o * in_size + i];
-        }
-        output[o] = relu(sum);
+// Полный forward: MFCC [40][20] → вероятность 0..1
+static float hermes_forward(const float mfcc[NUM_FRAMES][N_MFCC]) {
+    static float c1[16 * 38 * 18];
+    static float p1[16 * 19 * 9];
+    static float c2[8 * 17 * 7];
+    static float p2[8 * 8 * 3];       // 192 — вход Dense
+    float h[16];
+
+    conv2d_valid_relu(&mfcc[0][0], 40, 20, 1, &CONV1_W[0][0][0][0], CONV1_B, 16, c1);
+    maxpool2(c1, 38, 18, 16, p1);
+    conv2d_valid_relu(p1, 19, 9, 16, &CONV2_W[0][0][0][0], CONV2_B, 8, c2);
+    maxpool2(c2, 17, 7, 8, p2);
+
+    // Dense 192→16 + ReLU.  burn: y = x·W, W[in][out]
+    for (int o = 0; o < 16; o++) {
+        float s = FC1_B[o];
+        for (int i = 0; i < 192; i++) s += p2[i] * FC1_W[i][o];
+        h[o] = relu(s);
     }
-}
-
-// Dense + Sigmoid
-float dense_sigmoid(const float* input, int in_size,
-                    const float* weight, const float* bias,
-                    int out_size) {
-    float sum = bias[0];
-    for (int i = 0; i < in_size; i++) {
-        sum += input[i] * weight[i];
-    }
-    return sigmoid(sum);
-}
-
-// Полный forward pass
-float wake_word_forward(const float mfcc[INPUT_H][INPUT_W]) {
-    // Input: [1, 33, 20] → flatten to [33*20]
-    float input[INPUT_H * INPUT_W];
-    for (int y = 0; y < INPUT_H; y++)
-        for (int x = 0; x < INPUT_W; x++)
-            input[y * INPUT_W + x] = mfcc[y][x];
-
-    // Conv1: [1, 33, 20] → [16, 33, 20]
-    static float conv1_out[CONV1_OUT * INPUT_H * INPUT_W];
-    conv2d_relu(input, INPUT_H, INPUT_W, 1,
-                (const float*)CONV1_WEIGHT, CONV1_BIAS,
-                CONV1_OUT, 3, 3, conv1_out);
-
-    // MaxPool1: [16, 33, 20] → [16, 16, 10]
-    int p1_h, p1_w;
-    static float pool1_out[CONV1_OUT * 17 * 10];
-    maxpool2d(conv1_out, INPUT_H, INPUT_W, CONV1_OUT, pool1_out, &p1_h, &p1_w);
-
-    // Conv2: [16, 16, 10] → [8, 16, 10]
-    static float conv2_out[CONV2_OUT * 17 * 10];
-    conv2d_relu(pool1_out, p1_h, p1_w, CONV1_OUT,
-                (const float*)CONV2_WEIGHT, CONV2_BIAS,
-                CONV2_OUT, 3, 3, conv2_out);
-
-    // MaxPool2: [8, 16, 10] → [8, 8, 5] = 320
-    int p2_h, p2_w;
-    static float pool2_out[CONV2_OUT * 9 * 5];
-    maxpool2d(conv2_out, p1_h, p1_w, CONV2_OUT, pool2_out, &p2_h, &p2_w);
-
-    int flatten_size = CONV2_OUT * p2_h * p2_w;  // 320
-
-    // FC1: 320 → 16
-    static float fc1_out[FC1_OUT];
-    dense_relu(pool2_out, flatten_size,
-               (const float*)FC1_WEIGHT, FC1_BIAS,
-               FC1_OUT, fc1_out);
-
-    // FC2: 16 → 1 (sigmoid)
-    float score = dense_sigmoid(fc1_out, FC1_OUT,
-                                (const float*)FC2_WEIGHT, FC2_BIAS, 1);
-    return score;  // 0.0 ... 1.0
+    // Dense 16→1 → сигмоида
+    float logit = FC2_B[0];
+    for (int i = 0; i < 16; i++) logit += h[i] * FC2_W[i][0];
+    return sigmoid(logit);
 }
 ```
+
+Порядок flatten: burn `reshape([b, c*h*w])` идёт по (c, h, w) — ровно
+как `p2` заполнен выше. Если перепутать порядок, числа не сойдутся,
+хотя размер 192 совпадёт.
 
 ---
 
-## Основной цикл
+## Стриминг (окно скользит, а не прыгает)
+
+Слово длится 0.6–0.8с. Проверять раз в 300мс, как было в первом
+дизайне, нельзя: начало слова уезжает из окна. Правильно — кольцевой
+буфер сэмплов на 1.2с, каждые **100мс** (1600 сэмплов) считаем MFCC
+всего окна и forward:
 
 ```cpp
-// в CapAI firmware, Core 1
-void wake_word_task(void* param) {
-    float mfcc[33][20];
-    int16_t pcm[FRAME_SIZE];
-
+void hermes_task(void*) {
+    static int16_t ring[19200];      // 1.2с при 16kHz
+    static float mfcc[NUM_FRAMES][N_MFCC];
+    int hits = 0, cooldown = 0;
     while (true) {
-        // Читаем 30мс аудио
-        size_t n;
-        i2s_read(I2S_MIC_PORT, pcm, FRAME_SIZE * 2, &n, portMAX_DELAY);
-
-        // MFCC для этого кадра → накапливаем 33 кадра
-        compute_mfcc_frame(pcm, mfcc[frame_idx]);
-        frame_idx = (frame_idx + 1) % 33;
-
-        // Проверяем каждые 10 кадров (~300мс)
-        if (frame_idx % 10 == 0) {
-            float score = wake_word_forward(mfcc);
-            if (score > WAKE_THRESHOLD) {
-                xTaskNotifyGive(main_task_handle);
-            }
+        read_i2s_into_ring(ring, 1600);          // +100мс
+        if (cooldown > 0) { cooldown--; hits = 0; continue; }
+        if (ring_rms(ring) < NOISE_FLOOR) { hits = 0; continue; } // энергетический гейт
+        compute_mfcc(ring, mfcc);                // 40 кадров, CMVN внутри
+        float p = hermes_forward(mfcc);
+        hits = (p > WAKE_THRESHOLD) ? hits + 1 : 0;
+        if (hits >= 2) {                         // 2 окна подряд
+            xTaskNotifyGive(main_task_handle);
+            cooldown = 20;                       // 2с
+            hits = 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 ```
+
+Это ровно то, что моделирует `make stream` на Mac: те же 100мс, те же
+2 подтверждения, тот же cooldown. `WAKE_THRESHOLD` берётся из кривой
+`make eval`, не 0.5.
+
+Бюджет: forward ~2–3 мс на ESP32-S3 (240 МГц, 1152 MAC на conv2 —
+самое тяжёлое), MFCC 40 кадров ~5–8 мс. На период 100мс — ≤10% ядра.
 
 ---
 
 ## Память
 
-| Компонент | Размер | Где |
-|-----------|--------|-----|
-| Веса (PROGMEM) | ~26 KB | Flash |
-| Conv1 буфер | 10.6 KB | PSRAM |
-| Pool1 буфер | 10.9 KB | PSRAM |
-| Conv2 буфер | 5.4 KB | PSRAM |
-| Pool2 буфер | 1.4 KB | PSRAM |
-| FC1 буфер | 64 B | RAM |
-| MFCC буфер | 2.6 KB | RAM |
-| **Итого** | **~57 KB** | из 8MB PSRAM + 8MB Flash |
+| Буфер | Размер |
+|---|---|
+| Веса (flash) | 17.7 KB float / 4.4 KB int8 |
+| Кольцо PCM 1.2с | 38.4 KB |
+| MFCC 40×20 | 3.2 KB |
+| c1 16×38×18 | 43.8 KB |
+| p1 16×19×9 | 10.9 KB |
+| c2 8×17×7 | 3.8 KB |
+| p2 192 | 0.8 KB |
+| **Итого RAM** | **~100 KB** — из 512 KB SRAM, PSRAM не нужен |
 
----
-
-## Скорость
-
-| Операция | Время |
-|----------|-------|
-| MFCC (FFT + mel + DCT) | ~5мс |
-| Conv1 (16×3×3×1×33×20) | ~3мс |
-| Conv2 (8×3×3×16×16×10) | ~2мс |
-| FC1 + FC2 | ~1мс |
-| **Полный forward** | **~11мс** |
-| Проверка | каждые 300мс |
-
-Real-time. Без рантаймов, без TFLite, без зависимостей.
+c1 — самый большой буфер; при желании его можно не хранить целиком,
+считая conv1→pool1 построчно, но на S3 это преждевременно.
 
 ---
 

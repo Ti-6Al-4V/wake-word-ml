@@ -8,8 +8,8 @@
 
 - **Язык:** Rust
 - **Обучение:** [burn](https://github.com/tracel-ai/burn) — Rust ML framework
-- **Аудио:** `rustfft`, `hound` (WAV I/O), ручной MFCC
-- **Деплой:** ручной C++ CNN inference на ESP32-S3 (модель ~5K параметров, TFLite не нужен)
+- **Аудио:** `rustfft`, `hound` (WAV I/O), ручной MFCC (`src/mfcc.rs`)
+- **Деплой:** ручной C++ CNN inference на ESP32-S3 (модель 4425 параметров, TFLite не нужен)
 - **Интеграция:** CapAI firmware
 
 ## Почему Rust
@@ -22,7 +22,7 @@
 
 ## Почему ручной C++ inference вместо TFLite
 
-Модель крошечная: 2 conv слоя + 2 dense = ~5000 параметров, ~20 KB.
+Модель крошечная: 2 conv слоя + 2 dense = 4425 параметров, 18 KB float32.
 Ручной forward pass на C++ — ~200 строк. Никаких зависимостей, никаких рантаймов.
 Полный контроль, полное понимание.
 
@@ -33,8 +33,8 @@
 | [docs/00-learning-path.md](docs/00-learning-path.md) | **Начни отсюда**: учебник по шагам — что, зачем и почему на каждом этапе, с экспериментами руками |
 | [docs/01-theory.md](docs/01-theory.md) | Теория: звук → спектрограмма → нейросеть → классификация |
 | [docs/02-dataset.md](docs/02-dataset.md) | Сбор и подготовка датасета на Rust |
-| [docs/03-training.md](docs/03-training.md) | Обучение модели на burn |
-| [docs/04-deploy.md](docs/04-deploy.md) | Экспорт весов, ручной C++ inference на ESP32 |
+| [docs/03-training.md](docs/03-training.md) | Справочник по `train.rs` / `eval.rs`: API burn 0.21, флаги, выходы |
+| [docs/04-deploy.md](docs/04-deploy.md) | Экспорт весов, ручной C++ inference на ESP32 (под реальную модель 40×20) |
 | [docs/05-integration.md](docs/05-integration.md) | Интеграция в CapAI |
 | [docs/06-landscape.md](docs/06-landscape.md) | Как устроены голосовые агенты; обзор Porcupine/openWakeWord/microWakeWord/esp-sr; почему русского готового решения нет |
 | [docs/07-quality.md](docs/07-quality.md) | Как сделать рабочую модель: данные, метрики (false accepts/hour), стриминг, план фаз |
@@ -69,13 +69,13 @@ ambient-негативы, метрика ложных тревог в час) в
 INMP441 → I2S → PCM 16kHz 16-bit
     │
     ▼
-MFCC: извлечение признаков (20 коэффициентов × 40 кадров, окно 1.2с)
+MFCC: извлечение признаков (20 коэффициентов × 40 кадров, окно 1.2с, CMVN)
     │
     ▼
-CNN (~5000 параметров, ~20 KB, бинарные веса)
+CNN (4425 параметров, 18 KB, бинарные веса)
     │
     ▼
-binary: wake word / не wake word
+логит → сигмоида → порог (по кривой на val) → wake word / не wake word
     │
     ▼
 Если wake → CapAI просыпается

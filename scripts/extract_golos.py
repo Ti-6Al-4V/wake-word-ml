@@ -3,10 +3,14 @@
 # негативы «живая русская речь». В parquet аудио уже WAV 16kHz моно.
 # Детерминированно: фиксированный порядок шардов и фраз, стоп по лимиту.
 # Куски-паузы (RMS ниже порога) пропускаются, чтобы не тащить тишину.
+# Имя клипа: golos_p<фраза>_c<кусок>.wav — сплит группирует куски одной
+# фразы вместе (один диктор, одна сессия), иначе диктор из train
+# «подсматривается» в val (утечка по диктору).
+# Хвост фразы короче окна дополняется дизером (−60 дБFS), не нулями.
 #
 # Запуск: uv run --with pyarrow python3 scripts/extract_golos.py [лимит]
 
-import io, os, struct, sys, wave
+import io, os, random, struct, sys, wave
 
 import pyarrow.parquet as pq
 
@@ -22,7 +26,11 @@ shards = sorted(
 )
 os.makedirs(OUT, exist_ok=True)
 
+DITHER = 33  # амплитуда дизера в единицах i16 ≈ 0.001 = −60 дБFS
+rng = random.Random(42)
+
 n_clips = 0
+n_phrases = 0
 stop = False
 for shard in shards:
     path = f"{DL}/{shard}"
@@ -38,16 +46,17 @@ for shard in shards:
         if w.getframerate() != 16000 or w.getnchannels() != 1:
             continue
         samples = struct.unpack(f"<{w.getnframes()}h", w.readframes(w.getnframes()))
+        n_phrases += 1
         # Режем окнами по 1.2с без перекрытия; хвост короче половины окна выбрасываем
-        for start in range(0, len(samples) - WINDOW // 2, WINDOW):
+        for ci, start in enumerate(range(0, len(samples) - WINDOW // 2, WINDOW)):
             chunk = samples[start:start + WINDOW]
             if len(chunk) < WINDOW:
-                chunk = chunk + (0,) * (WINDOW - len(chunk))
+                chunk = chunk + tuple(rng.randint(-DITHER, DITHER) for _ in range(WINDOW - len(chunk)))
             rms = (sum(s * s for s in chunk) / len(chunk)) ** 0.5 / 32768
             if rms < RMS_MIN:
                 continue
             n_clips += 1
-            out = wave.open(f"{OUT}/golos_{n_clips:05}.wav", "wb")
+            out = wave.open(f"{OUT}/golos_p{n_phrases:05}_c{ci:02}.wav", "wb")
             out.setnchannels(1)
             out.setsampwidth(2)
             out.setframerate(16000)

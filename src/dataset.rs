@@ -27,16 +27,39 @@ pub struct Splits {
     pub test: Vec<Sample>,
 }
 
-/// Ключ группировки: имя файла без суффикса аугментации `_vN`.
-/// germes_real_0020_v7 → «germes_real_0020», и сам germes_real_0020
-/// даёт тот же ключ — значит они неразлучны при разбиении.
-/// У негативов суффикса нет: каждый файл — сам себе группа.
+/// Ключ группировки: файлы одного «источника правды» неразлучны при
+/// разбиении. Правила (по имени файла, без расширения):
+///
+/// - `germes_real_0020_v7`  → `germes_real_0020`  (аугментация _vN)
+/// - `golos_p00042_c03`     → `golos_p00042`      (нарезка фразы _cN:
+///   все куски одной фразы — один диктор, одна сессия)
+/// - `self_s01_c0007`       → `self_s01`          (нарезка своей речи)
+/// - `germes_t0_Dmitry_plus25` → `germes_t0_Dmitry` (5 скоростей одного
+///   TTS-голоса — почти один и тот же файл, держим вместе)
+/// - остальное              → сам себе группа
+///
+/// Суффикс снимается только если после `_v`/`_c` идут ЦИФРЫ: имя вроде
+/// `germes_voice` не пострадает.
 pub fn group_key(path: &Path) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    match stem.rfind("_v") {
-        Some(i) => stem[..i].to_string(),
-        None => stem.to_string(),
+    // 1. Снять суффикс аугментации/нарезки, если он есть.
+    let mut base = stem;
+    for tag in ["_v", "_c"] {
+        if let Some(i) = base.rfind(tag) {
+            let tail = &base[i + tag.len()..];
+            if !tail.is_empty() && tail.chars().all(|ch| ch.is_ascii_digit()) {
+                base = &base[..i];
+                break;
+            }
+        }
     }
+    // 2. TTS: germes_t<N>_<голос>_<скорость> → без скорости.
+    if base.starts_with("germes_t") {
+        if let Some(i) = base.rfind('_') {
+            return base[..i].to_string();
+        }
+    }
+    base.to_string()
 }
 
 /// Фишер–Йетс: честное перемешивание массива данным ГПСЧ.
@@ -120,11 +143,34 @@ pub fn load(pos_dir: &str, neg_dir: &str) -> Splits {
 /// WAV → окно сэмплов → MFCC-матрица [40][20] (см. src/mfcc.rs).
 /// Этим train превращает каждый файл в тензор.
 pub fn features(path: &Path) -> Vec<Vec<f32>> {
-    let mut reader = hound::WavReader::open(path).expect("wav не читается");
-    assert_eq!(reader.spec().sample_rate, 16_000, "датасет должен быть 16kHz (make preprocess)");
-    let samples: Vec<f32> = reader.samples::<i16>()
-        .filter_map(|s| s.ok())
-        .map(|s| s as f32 / 32768.0)
-        .collect();
+    let (samples, rate) = crate::audio::read_wav(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(rate, 16_000, "датасет должен быть 16kHz (make preprocess): {}", path.display());
     crate::mfcc::wav_to_mfcc(&samples)
+}
+
+/// Плоский вектор признаков (40·20 = 800 чисел) — форма, в которой
+/// батч уходит в тензор.
+pub fn features_flat(path: &Path) -> Vec<f32> {
+    features(path).into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group_key;
+    use std::path::Path;
+
+    #[test]
+    fn group_key_rules() {
+        let k = |s: &str| group_key(Path::new(&format!("dataset/x/{s}.wav")));
+        assert_eq!(k("germes_real_0020_v7"), "germes_real_0020");
+        assert_eq!(k("germes_real_0020"), "germes_real_0020");
+        assert_eq!(k("golos_p00042_c03"), "golos_p00042");
+        assert_eq!(k("self_s01_c0007"), "self_s01");
+        assert_eq!(k("germes_t0_DmitryNeural_plus25"), "germes_t0_DmitryNeural");
+        assert_eq!(k("germes_t0_DmitryNeural_norm_v3"), "germes_t0_DmitryNeural");
+        assert_eq!(k("negative_sc_00017"), "negative_sc_00017");
+        assert_eq!(k("conf_termes_0003"), "conf_termes_0003");
+        assert_eq!(k("germes_voice"), "germes_voice");
+    }
 }

@@ -1,10 +1,15 @@
-// Запись слова «Гермес» с микрофона гарнитуры.
+// Запись коротких дублей с микрофона гарнитуры.
 // Один дубль = WAV-файл 1.2 секунды (слово длится ~0.6-0.8с, остальное — тишина по краям).
-// Выход: dataset/raw/real/germes_real_0001.wav, 0002.wav, ...
+// Выход: <папка>/<префикс>_0001.wav, 0002.wav, ...
 //        (нативная частота микрофона, 16-bit, моно)
 //
-// Запуск:  cargo run --bin record -- <папка> <число дублей>
-// Пример:  cargo run --bin record -- dataset/raw/real 20
+// Запуск:  cargo run --bin record -- <папка> <число дублей> [слово] [префикс]
+// Примеры: cargo run --bin record -- dataset/raw/real 20
+//          cargo run --bin record -- dataset/raw/confusables 30 термес conf_termes
+//
+// Третий/четвёртый аргументы нужны для фонематических двойников: те же
+// 1.2-секундные дубли, тот же микрофон, но ДРУГОЕ слово — это негативы,
+// которые рисуют границу решения прямо рядом с «Гермесом».
 
 // В Rust, чтобы вызвать метод типа (device.default_input_config(), stream.play(), ...),
 // нужно импортировать ТРЕЙТ, в котором этот метод определён. Поэтому use такой:
@@ -26,6 +31,9 @@ fn main() {
     // ошибка парсинга («abc» вместо числа) становится None.
     // unwrap_or(10): аргумента нет или это мусор → 10 дублей по умолчанию.
     let count: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+    // Что говорить и как называть файлы. По умолчанию — «Гермес» / germes_real.
+    let word = std::env::args().nth(3).unwrap_or_else(|| "Гермес".to_string());
+    let prefix = std::env::args().nth(4).unwrap_or_else(|| "germes_real".to_string());
 
     // Создаём выходную папку (вместе со всеми промежуточными, если их нет).
     // expect = unwrap с твоим текстом ошибки: если не вышло — паника с понятным сообщением.
@@ -84,7 +92,7 @@ fn main() {
 
     // --- Цикл по дублям: existing..(existing + count) — диапазон Range ---
     for i in existing..(existing + count) {
-        println!("\n[{}/{}] Приготовься... скажи «Гермес»!", i + 1, existing + count);
+        println!("\n[{}/{}] Приготовься... скажи «{word}»!", i + 1, existing + count);
         // Одна секунда на вдох и подготовку. sleep приостанавливает текущий поток.
         std::thread::sleep(std::time::Duration::from_secs(1));
 
@@ -144,7 +152,7 @@ fn main() {
         // а замок мьютекса (временный MutexGuard) тут же освобождается.
         let samples = buf.lock().unwrap().clone();
         // {:04} — число минимум в 4 цифры, дополненное нулями: 7 → "0007".
-        let path = format!("{out_dir}/germes_real_{:04}.wav", i + 1);
+        let path = format!("{out_dir}/{prefix}_{:04}.wav", i + 1);
         write_wav(&path, &samples, sample_rate);
         println!("Сохранено: {path}");
 

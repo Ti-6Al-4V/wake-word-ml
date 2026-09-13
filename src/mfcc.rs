@@ -11,12 +11,28 @@
 //!   → 40 кадров по 480 сэмплов (30мс), каждый под окном Хэмминга
 //!   → FFT 512 → спектр мощности
 //!   → 20 треугольных фильтров на mel-шкале (модель слуха)
-//!   → log (слух воспринимает громкость логарифмически)
-//!   → DCT (сжать и декоррелировать) → 20 коэффициентов на кадр
-//!   → нормализация всей матрицы (среднее 0, дисперсия 1)
+//!   → log с полом (слух воспринимает громкость логарифмически)
+//!   → DCT (декоррелировать) → 20 коэффициентов на кадр
+//!   → нормализация КАЖДОГО коэффициента по времени (среднее 0, дисперсия 1)
 //! ```
 //!
 //! Итог: матрица [40 кадров × 20 коэффициентов] на окно 1.2с.
+//!
+//! Два решения, которые легко сделать неправильно:
+//!
+//! **Пол логарифма.** log(energy + 1e-8) для кадра из цифровых нулей даёт
+//! −18.4 во всех полосах — значение, которого у живого микрофона не бывает
+//! (его шумовой пол на порядки выше). Такой кадр — флаг «искусственная
+//! тишина», и если он есть только у одного класса, модель учит флаг, а не
+//! слово. Пол LOG_FLOOR = 1e-5 ставит нижнюю планку примерно на уровне
+//! −60 дБFS: ниже неё все «тишины» выглядят одинаково.
+//!
+//! **Нормализация по коэффициентам, а не по всей матрице.** Коэффициент 0
+//! (общая энергия) по величине в разы больше остальных; при общей
+//! нормализации он один задаёт среднее и дисперсию, а тонкие коэффициенты
+//! сжимаются почти в ноль. Стандарт (CMVN) — каждый коэффициент
+//! нормализуется отдельно по своим 40 кадрам. Бонус: так же считается на
+//! ESP32 для каждого окна, без плавающих глобальных статистик.
 
 use rustfft::{num_complex::Complex, FftPlanner};
 
@@ -30,6 +46,8 @@ pub const NUM_FRAMES: usize = 40;   // 1.2с окно: 19200 / 480
 pub const WINDOW_SAMPLES: usize = 19_200; // 1.2с при 16kHz
 
 const PRE_EMPHASIS: f32 = 0.97;
+/// Нижняя планка энергии mel-полосы перед логарифмом (см. шапку файла).
+pub const LOG_FLOOR: f32 = 1e-5;
 
 // --- Mel-шкала: как человек воспринимает высоту звука ---
 // Низкие частоты мы различаем лучше высоких; mel-шкала это моделирует.
@@ -93,6 +111,9 @@ pub fn wav_to_mfcc(samples: &[f32]) -> Vec<Vec<f32>> {
     // выравнивает спектр, чтобы ВЧ-согласные (с, ш, р) были лучше видны.
     let mut x = vec![0.0f32; WINDOW_SAMPLES];
     let n = samples.len().min(WINDOW_SAMPLES);
+    if n == 0 {
+        return vec![vec![0.0f32; N_MFCC]; NUM_FRAMES];
+    }
     x[0] = samples[0];
     for i in 1..n {
         x[i] = samples[i] - PRE_EMPHASIS * samples[i - 1];
@@ -127,11 +148,12 @@ pub fn wav_to_mfcc(samples: &[f32]) -> Vec<Vec<f32>> {
         let n_bins = FFT_SIZE / 2 + 1;
         let power: Vec<f32> = buf[..n_bins].iter().map(|c| c.norm_sqr()).collect();
 
-        // 4-5. Mel-фильтры + log. Эпсилон внутри log защищает от log(0).
+        // 4-5. Mel-фильтры + log с полом: всё тише LOG_FLOOR считается
+        //      одинаковой тишиной (и цифровые нули, и дизер, и тихий микрофон).
         let mut mel_log = vec![0.0f32; N_MELS];
         for m in 0..N_MELS {
             let energy: f32 = bank[m].iter().zip(&power).map(|(w, p)| w * p).sum();
-            mel_log[m] = (energy + 1e-8).ln();
+            mel_log[m] = energy.max(LOG_FLOOR).ln();
         }
 
         // 6. DCT → коэффициенты MFCC.
@@ -140,15 +162,49 @@ pub fn wav_to_mfcc(samples: &[f32]) -> Vec<Vec<f32>> {
         }
     }
 
-    // 7. Глобальная нормализация матрицы: среднее 0, дисперсия 1.
-    // Убирает остаточную зависимость от громкости записи.
-    let all = NUM_FRAMES * N_MFCC;
-    let mean: f32 = mfcc.iter().flatten().sum::<f32>() / all as f32;
-    let std: f32 = (mfcc.iter().flatten().map(|v| (v - mean).powi(2)).sum::<f32>() / all as f32).sqrt() + 1e-8;
-    for row in &mut mfcc {
-        for v in row.iter_mut() {
-            *v = (*v - mean) / std;
+    // 7. Нормализация по коэффициентам (CMVN): для каждого из 20
+    // коэффициентов среднее 0 и дисперсия 1 по его 40 кадрам.
+    // Убирает громкость записи и «окраску» микрофона (постоянный сдвиг
+    // спектра), оставляя то, что меняется во времени — само слово.
+    for c in 0..N_MFCC {
+        let mean: f32 = mfcc.iter().map(|row| row[c]).sum::<f32>() / NUM_FRAMES as f32;
+        let var: f32 = mfcc.iter().map(|row| (row[c] - mean).powi(2)).sum::<f32>() / NUM_FRAMES as f32;
+        let std = var.sqrt() + 1e-5;
+        for row in mfcc.iter_mut() {
+            row[c] = (row[c] - mean) / std;
         }
     }
     mfcc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shape_and_per_coefficient_normalization() {
+        // Синус 440 Гц с дизером: матрица нужной формы, каждый коэффициент
+        // после CMVN имеет среднее ≈0 и дисперсию ≈1 по кадрам.
+        let mut rng = crate::audio::rng_for("t", 0);
+        let s: Vec<f32> = (0..WINDOW_SAMPLES)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin()
+                + crate::audio::dither(&mut rng))
+            .collect();
+        let m = wav_to_mfcc(&s);
+        assert_eq!(m.len(), NUM_FRAMES);
+        assert_eq!(m[0].len(), N_MFCC);
+        for c in 0..N_MFCC {
+            let mean: f32 = m.iter().map(|r| r[c]).sum::<f32>() / NUM_FRAMES as f32;
+            assert!(mean.abs() < 1e-3, "коэф {c}: mean {mean}");
+        }
+    }
+
+    #[test]
+    fn zeros_do_not_explode() {
+        // Цифровые нули: log-пол держит значения в разумных пределах,
+        // а std=0 не даёт NaN.
+        let m = wav_to_mfcc(&vec![0.0f32; WINDOW_SAMPLES]);
+        assert!(m.iter().flatten().all(|v| v.is_finite()));
+        assert!(wav_to_mfcc(&[]).iter().flatten().all(|v| *v == 0.0));
+    }
 }
