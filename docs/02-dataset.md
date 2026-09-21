@@ -1,377 +1,109 @@
-# Датасет
+# Датасет: происхождение, подготовка и честное разбиение
 
-> **Примечание (2026-08-16, дополнено 2026-09-13):** это первоначальный
-> дизайн, код здесь — эскизы, не то, что лежит в `src/`. Реальная
-> реализация разошлась: окно 1.2с вместо 1с; ресемпл через ffmpeg;
-> Golos — через HF-зеркало `bonlime/golos-test` (ссылки sc.link мертвы);
-> короткие файлы дополняются дизером, не нулями; MFCC с полом
-> логарифма и нормализацией по коэффициенту (не по матрице);
-> аугментации — реальные фоны и сдвиг по всему окну вместо громкости
-> и ±10%; добавлены негативы своим голосом. Актуальная инструкция —
-> [08-runbook](08-runbook.md), объяснения — [00-learning-path](00-learning-path.md),
-> размеры — [09-dataset-sizing](09-dataset-sizing.md).
+Исполняемые команды — [08-runbook](08-runbook.md). Здесь контракт данных
+и ограничения текущего кода. Прежние примеры с 33 кадрами заменены:
+актуальный вход — **16kHz, PCM16 mono, 19200 отсчётов, MFCC 40×20**.
 
-Сбор и подготовка данных на Rust. Позитивные — TTS + свой голос, негативные — готовые датасеты.
+## 1. Метки и условия
 
----
+V1 узнаёт слово «Гермес» твоим голосом. Слово внутри фразы — позитив;
+похожие слова без него — негативы. Произнесение самого слова из телевизора
+нельзя автоматически назвать негативом, пока задача не включает
+идентификацию диктора или обращённости речи. Контракт — L0 в [лабораторных](10-labs.md).
 
-## Источники
+Для каждого исходника сохраняй метку, источник, session_id, speaker_id,
+дату, микрофон, помещение/шум, исходное имя и checksum. Для производного
+файла — parent_id и параметры преобразования. Эти метаданные пока не
+подключены к загрузчику: веди CSV рядом с сырыми записями.
 
-| Категория | Источник | Кол-во |
-|-----------|----------|--------|
-| Позитивные (синтетические) | TTS генерация "гермес" разными голосами | ~500 |
-| Позитивные (реальные) | Запись своим голосом через INMP441 | ~100 |
-| Позитивные (аугментация) | pitch/time/noise/volume ×6 | ~3600 |
-| Негативные (русская речь) | [Golos](https://github.com/sberdevices/golos) (Сбер, 1240ч) | ~2000 |
-| Негативные (короткие слова) | [Google Speech Commands](https://research.google/blog/launching-the-speech-commands-dataset/) | ~2000 |
-| Фон | Тишина, музыка, улица | ~500 |
+## 2. Что собирать
 
----
+- Позитивы: несколько сессий своего голоса, разные темпы и расстояния.
+- Негативы: тот же голос/микрофон/комната, связная речь без слова.
+- Двойники: «термос», «Герман», «Гермиона», похожие части фраз.
+- Фон: реальные помещения, улица, музыка, тишина микрофона.
+- Дополнения: TTS и внешние речевые корпуса; проверяй метки и условия использования.
 
-## Позитивные: TTS генерация
+Ни один источник не должен идеально предсказывать класс. Разные голоса
+TTS полезны, но количество файлов не равно количеству независимых голосов.
+Начинай с малого диагностического набора; размеры расширяй по
+[кривой обучения](09-dataset-sizing.md), а не по фиксированной квоте.
 
-```rust
-// src/generate_tts.rs
-// Генерируем "гермес" через Edge TTS (через subprocess) или kokoro-rs
+## 3. Что делает код
 
-use std::process::Command;
+| Команда | Вход → выход | Особенности |
+|---|---|---|
+| `make record N=20` | микрофон → `dataset/raw/real` | Частота зависит от устройства |
+| `make record_speech SECS=300` | микрофон → `raw/self_speech` | Одна сессия — один исходник |
+| `make chop` | self_speech → self_speech_clips | Окна 1.2с, тихие отбрасываются |
+| `make record_confusables WORD=термос N=20` | микрофон → raw/confusables | Сохраняй сведения о сессии |
+| `make preprocess IN=... OUT=...` | WAV/MP3 → PCM16 mono 16kHz | Декод/ресемплинг ffmpeg, peak 0.9, crop/pad до 1.2с |
+| `make augment` | positive → positive | 8 фиксированных вариантов на исходник |
+| `make split-check` | positive/negative | Проверяет пересечение ключей `group_key` |
 
-const VOICES: &[&str] = &[
-    "ru-RU-SvetlanaNeural",
-    "ru-RU-DmitriNeural",
-];
+Preprocess пропускает уже готовые имена. После изменения алгоритма нужна
+новая версия производных данных. `make rebuild-dataset` **удаляет и
+пересоздаёт** positive, negative и raw/golos_clips; прежде сохрани manifests
+и убедись, что все нужные исходники есть в raw. Экспортированные вручную
+файлы, которых нет в raw, эта команда не восстановит.
 
-const SPEEDS: &[f32] = &[0.8, 0.9, 1.0, 1.1, 1.2];
+Длинные WAV для потоковой оценки нельзя пропускать через этот preprocess:
+он обрежет их до 1.2с. Используй только конвертацию формата:
 
-fn generate_tts(output_dir: &str) {
-    let mut idx = 1;
-    for voice in VOICES {
-        for &speed in SPEEDS {
-            let filename = format!("{}/germes_tts_{:03}.wav", output_dir, idx);
-            // edge-tts через CLI
-            Command::new("edge-tts")
-                .args([
-                    "--text", "гермес",
-                    "--voice", voice,
-                    "--rate", &format!("{}%", (speed * 100.0) as i32),
-                    "--write-media", &filename,
-                ])
-                .status()
-                .unwrap();
-            idx += 1;
-        }
-    }
-    println!("Generated {} TTS samples", idx - 1);
-}
+```bash
+ffmpeg -i input.wav -ac 1 -ar 16000 -c:a pcm_s16le ambient.wav
 ```
 
-## Позитивные: запись своим голосом
-
-```rust
-// src/record.rs
-// Запись с микрофона, 1 сек на каждое произношение
-
-use hound::{WavWriter, WavSpec};
-
-fn record_word(output_dir: &str, count: u32) {
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate: 16000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    for i in 1..=count {
-        println!("Запись {}/{} — скажи \"гермес\"", i, count);
-
-        let filename = format!("{}/germes_real_{:03}.wav", output_dir, i);
-        let mut writer = WavWriter::create(&filename, spec).unwrap();
-
-        // cpal захват 1 сек аудио → writer.write_sample()
-        // ...
-
-        println!("Сохранено: {}", filename);
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-}
-```
-
-## Аугментация
-
-Из 600 реальных+TTS → 3600 аугментированных:
-
-```rust
-// src/augment.rs
-use rustfft::{FftPlanner, num_complex::Complex};
-
-pub fn augment(samples: &[f32], sr: u32) -> Vec<Vec<f32>> {
-    let mut result = Vec::new();
-
-    // Pitch shift через FFT
-    for shift in [-2.0, 2.0] {
-        result.push(pitch_shift(samples, sr, shift));
-    }
-
-    // Time stretch
-    for rate in [0.9, 1.1] {
-        result.push(time_stretch(samples, rate));
-    }
-
-    // Добавить шум
-    for snr_db in [10.0, 20.0] {
-        let noise: Vec<f32> = (0..samples.len())
-            .map(|_| {
-                let n = rand::random::<f32>() * 2.0 - 1.0;
-                n * 0.01 * 10.0_f32.powf(-snr_db / 20.0)
-            })
-            .collect();
-        result.push(samples.iter().zip(noise.iter()).map(|(s, n)| s + n).collect());
-    }
-
-    // Громкость
-    for vol in [0.7, 1.3] {
-        result.push(samples.iter().map(|s| s * vol).collect());
-    }
-
-    result
-}
-```
-
----
-
-## Негативы: зачем в датасете английские слова
-
-Один из неочевидных вопросов дизайна: wake word русский, а 2000 из 6000
-негативов — английские слова из Google Speech Commands. Смысл есть,
-и вот он:
-
-1. **Негативы учат область «нет» — а ей нужно разнообразие, а не только
-   русский.** Чем шире класс звуков, на которых модель твердо говорит
-   «нет», тем прочнее граница. Английский добавляет фонемы, которых
-   в русском нет (межзубные, другой набор гласных) — область «нет»
-   расширяется за пределы русской фонетики.
-2. **SC структурно похож на wake word.** Это КОРОТКИЕ изолированные
-   слова ~1с — ровно тот класс звуков, который мог бы ложно сработать
-   (длинные фразы и так не похожи на «Гермес»). Учить модель отличать
-   слово от слова — на коротких словах и правильно.
-3. **Защита от «ленивых» признаков.** Если бы все негативы были только
-   русской речью, модель могла бы выучить короткий путь «русская речь
-   vs тишина/синтетика» вместо «это именно Гермес?». Чужой язык
-   заставляет опираться на сам паттерн слова.
-4. **Дешёвое масштабное разнообразие.** 105 829 клипов, тысячи дикторов,
-   микрофонов и условий записи — бесплатно. Ни один русский датасет
-   такое разнообразие коротких слов не даёт.
-
-При этом SC — **дополнение, а не замена**. Ядро негативов — Golos
-(живая русская речь, распределение «из жизни») и фонематические
-двойники («термес», «Герман») — самые ценные, потому что граница
-решения проходит прямо возле них. Если метрика FA попросит больше
-русских негативов — у Golos есть дополнительные подмножества
-(например, 10-часовые зеркала на HuggingFace), расшириться несложно.
-
----
-
-## Негативные: Golos
-
-```rust
-// src/download_golos.rs
-// Скачиваем небольшой кусок Golos dataset, вырезаем случайные 1-сек фрагменты
-
-use std::process::Command;
-
-fn download_golos(output_dir: &str, count: u32) {
-    // Скачиваем test.tar (1.3 GB) с openslr.org/114/
-    let url = "https://openslr.org/resources/114/test.tar";
-
-    Command::new("wget")
-        .args(["-q", url, "-O", "/tmp/golos_test.tar"])
-        .status()
-        .unwrap();
-
-    Command::new("tar")
-        .args(["xf", "/tmp/golos_test.tar", "-C", "/tmp/golos/"])
-        .status()
-        .unwrap();
-
-    // Вырезаем случайные 1-сек фрагменты из WAV файлов
-    let mut idx = 1;
-    for entry in std::fs::read_dir("/tmp/golos/test/wavs/").unwrap() {
-        if idx > count { break; }
-        let path = entry.unwrap().path();
-        if path.extension().unwrap() == "wav" {
-            // Загружаем, берём случайный 1-сек кусок, сохраняем
-            let filename = format!("{}/negative_golos_{:04}.wav", output_dir, idx);
-            extract_random_1sec(&path, &filename);
-            idx += 1;
-        }
-    }
-    println!("Extracted {} Golos samples", idx - 1);
-}
-```
-
-## Негативные: Google Speech Commands
-
-```rust
-// src/download_speech_commands.rs
-// Скачиваем Speech Commands v0.02, используем все слова как негативные
-
-fn download_speech_commands(output_dir: &str) {
-    let url = "https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_v0.02.tar.gz";
-
-    Command::new("wget")
-        .args(["-q", url, "-O", "/tmp/speech_commands.tar.gz"])
-        .status()
-        .unwrap();
-
-    Command::new("tar")
-        .args(["xzf", "/tmp/speech_commands.tar.gz", "-C", "/tmp/speech_commands/"])
-        .status()
-        .unwrap();
-
-    // Копируем все .wav files (yes, no, stop, go...) как негативные
-    let mut idx = 1;
-    for entry in walkdir::WalkDir::new("/tmp/speech_commands/") {
-        let entry = entry.unwrap();
-        if entry.path().extension().map_or(false, |e| e == "wav") {
-            let filename = format!("{}/negative_sc_{:05}.wav", output_dir, idx);
-            std::fs::copy(entry.path(), &filename).ok();
-            idx += 1;
-        }
-    }
-    println!("Copied {} Speech Commands samples", idx - 1);
-}
-```
-
----
-
-## Preprocessing
-
-Все WAV → 16kHz, mono, 1 сек:
-
-```rust
-// src/preprocess.rs
-use hound::{WavReader, WavSpec, WavWriter};
-
-pub fn preprocess(input: &str, output: &str) {
-    let mut reader = WavReader::open(input).unwrap();
-    let samples: Vec<f32> = reader.samples::<i16>()
-        .filter_map(|s| s.ok())
-        .map(|s| s as f32 / 32768.0)
-        .collect();
-
-    // Нормализация громкости
-    let max = samples.iter().cloned().fold(0.0f32, f32::max).abs();
-    let normalized: Vec<f32> = samples.iter().map(|s| s / max * 0.9).collect();
-
-    // Обрезка/пад до 16000 сэмплов (1 сек)
-    let mut padded = vec![0.0f32; 16000];
-    let len = normalized.len().min(16000);
-    padded[..len].copy_from_slice(&normalized[..len]);
-
-    let out_spec = WavSpec {
-        channels: 1, sample_rate: 16000,
-        bits_per_sample: 16, sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = WavWriter::create(output, out_spec).unwrap();
-    for s in &padded {
-        writer.write_sample((*s * 32767.0) as i16).unwrap();
-    }
-}
-```
-
----
-
-## MFCC извлечение
-
-```rust
-// src/mfcc.rs
-use rustfft::{FftPlanner, num_complex::Complex};
-
-pub const N_MFCC: usize = 20;
-pub const FRAME_SIZE: usize = 480;
-pub const HOP_SIZE: usize = 480;
-pub const FFT_SIZE: usize = 512;
-pub const NUM_FRAMES: usize = 33;
-
-pub fn wav_to_mfcc(samples: &[f32], sr: u32) -> [[f32; N_MFCC]; NUM_FRAMES] {
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(FFT_SIZE);
-
-    let hamming: Vec<f32> = (0..FRAME_SIZE)
-        .map(|i| 0.54 - 0.46 * (2.0 * std::f32::consts::PI * i as f32 / (FRAME_SIZE - 1) as f32).cos())
-        .collect();
-
-    let mel_filters = compute_mel_filterbank();
-    let dct_matrix = compute_dct_matrix();
-
-    let mut mfcc = [[0.0f32; N_MFCC]; NUM_FRAMES];
-
-    for frame in 0..NUM_FRAMES {
-        let start = frame * HOP_SIZE;
-        let mut windowed = vec![Complex::new(0.0, 0.0); FFT_SIZE];
-        for i in 0..FRAME_SIZE.min(samples.len() - start) {
-            windowed[i] = Complex::new(samples[start + i] * hamming[i], 0.0);
-        }
-
-        fft.process(&mut windowed);
-        let power: Vec<f32> = windowed[..FFT_SIZE/2].iter().map(|c| c.norm_sqr()).collect();
-
-        let mut mel_energy = [0.0f32; N_MFCC];
-        for m in 0..N_MFCC {
-            for k in 0..FFT_SIZE/2 {
-                mel_energy[m] += mel_filters[m][k] * power[k];
-            }
-        }
-        for m in 0..N_MFCC { mel_energy[m] = (mel_energy[m] + 1e-8).ln(); }
-
-        for m in 0..N_MFCC {
-            for k in 0..N_MFCC {
-                mfcc[frame][m] += dct_matrix[m][k] * mel_energy[k];
-            }
-        }
-    }
-
-    // Нормализация
-    let mean: f32 = mfcc.iter().flat_map(|r| r.iter()).sum::<f32>() / (NUM_FRAMES * N_MFCC) as f32;
-    let std = (mfcc.iter().flat_map(|r| r.iter()).map(|v| (v - mean).powi(2)).sum::<f32>() / (NUM_FRAMES * N_MFCC) as f32).sqrt() + 1e-8;
-    for frame in 0..NUM_FRAMES {
-        for m in 0..N_MFCC { mfcc[frame][m] = (mfcc[frame][m] - mean) / std; }
-    }
-
-    mfcc
-}
-```
-
----
-
-## Структура датасета
-
-```
-dataset/
-├── positive/
-│   ├── germes_tts_001.wav      # TTS синтетические
-│   ├── germes_tts_002.wav
-│   ├── germes_real_001.wav     # свой голос
-│   ├── germes_aug_0001.wav     # аугментированные
-│   └── ... (~3700)
-├── negative/
-│   ├── negative_golos_0001.wav # русская речь (Golos)
-│   ├── negative_sc_00001.wav   # короткие слова (Speech Commands)
-│   └── ... (~4000)
-└── background/
-    ├── silence_001.wav
-    ├── street_001.wav
-    └── ... (~500)
-```
-
----
-
-## Разделение
-
-70% train / 15% val / 15% test. Стратифицированное (сохраняем пропорцию позитив/негатив).
-
----
-
-## Дальше
-
-- [03-training.md](03-training.md) — обучаем на burn
+## 4. Аугментации
+
+Текущий augment: реальные фоны SNR 15/5 dB, изменение скорости 0.9/1.1
+(темп и высота одновременно), белый шум 20/10/5 dB, перенос выделенного
+по энергии фрагмента внутри окна. Это не независимый pitch-shift и не
+реалистичная модель всех шумов. Детектор границ по энергии может ошибаться.
+
+Сначала выдели исходные группы train/val/test, затем аугментируй train.
+Текущий удобный `make augment` создаёт варианты всех позитивов ДО split;
+группировка удерживает копии вместе, но val/test содержат синтетические
+варианты. Их метрики характеризуют этот смешанный набор, не чистый live-test.
+Для лабораторного сравнения реализуй train-only аугментацию с manifest.
+Отдельный финальный тест хранится вне positive/negative.
+
+Фоновые записи и RIR тоже дели по источникам. Один и тот же шум в train
+и test может сделать шумовой тест легче. Шумовые преобразования полезно
+проверять для обоих классов, чтобы сам шум не означал «позитив».
+
+## 5. Разбиение: что гарантировано сейчас
+
+`src/dataset.rs` удаляет суффиксы аугментаций, группирует нарезки фразы
+Golos, одной записи своей речи и варианты скорости TTS. Затем перемешивает
+группы и делит их 70/15/15 **внутри каждого класса**.
+
+Это защищает от некоторых утечек оригинал→копия, но не гарантирует:
+
+- разделение разных дублей одной сессии;
+- разделение всех фраз одного диктора Golos или Speech Commands;
+- разделение общей сессии между позитивами и негативами;
+- независимость фоновых записей и синтезаторов;
+- сохранение прежних сплитов после добавления файлов.
+
+Seed даёт повторяемость только при неизменных данных и реализации.
+«Пересечений ключей нет» не означает «любых утечек нет».
+
+Для финальных экспериментов реализуй manifest с явным split. Группируй
+по нужной независимой единице (сессия для своего голоса, диктор для новых
+голосов), совместно для обоих классов. Проверяй каждый split на оба класса,
+число независимых групп и покрытие условий. Не назначай один session_id
+в разные сплиты ради красивой пропорции.
+
+## 6. QC перед обучением
+
+1. Прослушай случайные файлы каждого источника и все подозрительные.
+2. Проверь формат, длину, клиппинг, слово целиком, правильность метки.
+3. Построй распределения длительности исходника, RMS и источников по классам.
+4. Проверь совпадения checksum и связь всех производных с оригиналом.
+5. Проверь независимость сессий/дикторов и фонов выбранного holdout.
+6. Сохрани manifests и версию предобработки с экспериментом.
+
+Тихие фоны необходимы для always-on оценки. Текущий preprocess пропускает
+почти нулевые записи, а chop — тихие фрагменты; это ограничение сборщика,
+а не основание исключать тишину из поведения детектора.

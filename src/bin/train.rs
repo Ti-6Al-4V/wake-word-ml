@@ -34,7 +34,7 @@ use std::io::Write;
 
 use wake_word_ml::dataset::{self, Sample, SEED};
 use wake_word_ml::mfcc::{N_MFCC, NUM_FRAMES};
-use wake_word_ml::model::{batch_tensor, sigmoid, HermesNet};
+use wake_word_ml::model::{batch_tensor, binary_cross_entropy, sigmoid, HermesNet};
 
 // Два типа бэкенда: с автодифференцированием для обучения (считает
 // градиенты) и чистый Wgpu для инференса/валидации (быстрее, без графов).
@@ -74,9 +74,7 @@ fn evaluate(model: &HermesNet<InferBackend>, data: &Cached, batch: usize, device
         let logits: Vec<f32> = model.forward(x).into_data().into_vec::<f32>().expect("логиты не снять с GPU");
         for (logit, &y) in logits.into_iter().zip(&data.labels[start..end]) {
             let p = sigmoid(logit);
-            // BCE = −[y·ln p + (1−y)·ln(1−p)]; clamp — чтобы ln(0) не дал −inf
-            let pc = p.clamp(1e-7, 1.0 - 1e-7);
-            loss_sum += -(y * pc.ln() + (1.0 - y) * (1.0 - pc).ln());
+            loss_sum += binary_cross_entropy(logit, y);
             match (p > 0.5, y > 0.5) {
                 (true, true) => tp += 1,
                 (false, true) => fn_ += 1,
@@ -100,6 +98,10 @@ fn main() {
     let lr = arg(3).unwrap_or(1e-3);
     let dropout = arg(4).unwrap_or(0.0);
     let weight_decay = arg(5).unwrap_or(0.0) as f32;
+    assert!(epochs > 0 && batch > 0, "эпохи и батч должны быть > 0");
+    assert!(lr.is_finite() && lr > 0.0, "lr должен быть конечным и > 0");
+    assert!((0.0..1.0).contains(&dropout), "dropout должен быть в [0,1)");
+    assert!(weight_decay.is_finite() && weight_decay >= 0.0, "weight decay должен быть конечным и >= 0");
     println!("эпох {epochs} | батч {batch} | lr {lr} | dropout {dropout} | weight_decay {weight_decay}");
 
     let device = WgpuDevice::DefaultDevice;
@@ -108,6 +110,10 @@ fn main() {
 
     let splits = dataset::load("dataset/positive", "dataset/negative");
     let count = |v: &[Sample]| v.iter().filter(|s| s.label > 0.5).count();
+    for (name, samples) in [("train", &splits.train), ("val", &splits.val)] {
+        let positives = count(samples);
+        assert!(positives > 0 && positives < samples.len(), "{name}: нужны оба класса; проверь данные и число групп");
+    }
     println!("train={} (позитивов {}) val={} (позитивов {}) test={}",
         splits.train.len(), count(&splits.train), splits.val.len(), count(&splits.val), splits.test.len());
 
@@ -149,7 +155,7 @@ fn main() {
         }
 
         let mut loss_sum = 0.0f32;
-        let mut n_batches = 0usize;
+        let mut n_seen = 0usize;
         for chunk in idx.chunks(batch) {
             // Собираем батч из кэша признаков.
             let mut feats = Vec::with_capacity(chunk.len() * FEAT);
@@ -169,14 +175,17 @@ fn main() {
             let grads = GradientsParams::from_grads(loss.backward(), &model); // backprop
             model = optim.step(lr, model, grads);      // Adam обновляет веса
 
-            loss_sum += loss.into_scalar();
-            n_batches += 1;
+            let batch_loss: f32 = loss.into_scalar();
+            assert!(batch_loss.is_finite(), "loss не конечен; проверь входы и lr");
+            loss_sum += batch_loss * b as f32;
+            n_seen += b;
         }
-        let train_loss = loss_sum / n_batches.max(1) as f32;
+        let train_loss = loss_sum / n_seen as f32;
 
         // --- Валидация без градиентов: .valid() даёт модель на чистом Wgpu ---
         let vnet = model.clone().valid();
         let v = evaluate(&vnet, &val, batch, &device);
+        assert!(v.loss.is_finite(), "val loss не конечен");
         println!("эпоха {:2}/{} за {:.1}с | loss {:.4} | val loss {:.4} | val acc {:.3} | TPR {:.3} | FA-доля {:.4}",
             epoch + 1, epochs, t0.elapsed().as_secs_f32(), train_loss, v.loss, v.acc, v.tpr, v.fa);
         writeln!(log, "{},{:.5},{:.5},{:.4},{:.4},{:.5}", epoch + 1, train_loss, v.loss, v.acc, v.tpr, v.fa).unwrap();

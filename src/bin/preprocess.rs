@@ -77,7 +77,7 @@ fn main() {
         let status = Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(path)
-            .args(["-ac", "1", "-ar", &TARGET_RATE.to_string(), "-f", "wav"])
+            .args(["-ac", "1", "-ar", &TARGET_RATE.to_string(), "-c:a", "pcm_s16le", "-f", "wav"])
             .arg(&tmp)
             .status();
         if !status.map_or(false, |s| s.success()) {

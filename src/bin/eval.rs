@@ -70,6 +70,8 @@ fn eval_split(split: &str, device: &WgpuDevice) {
         "test" => &splits.test,
         other => panic!("сплит {other}: ожидаю val или test"),
     };
+    assert!(samples.iter().any(|s| s.label > 0.5) && samples.iter().any(|s| s.label < 0.5),
+        "для оценки нужны оба класса в сплите");
     let model = load_model(device);
     let feats: Vec<f32> = samples.iter().flat_map(|s| dataset::features_flat(&s.path)).collect();
     let probs = predict(&model, &feats, device);
@@ -78,10 +80,10 @@ fn eval_split(split: &str, device: &WgpuDevice) {
     let n_neg = samples.len() - n_pos;
     let n_pos_groups = samples.iter().filter(|s| s.label > 0.5)
         .map(|s| dataset::group_key(&s.path)).collect::<std::collections::HashSet<_>>().len();
-    println!("сплит {split}: {} файлов — позитивов {n_pos} (независимых исходников {n_pos_groups}), негативов {n_neg}\n",
+    println!("сплит {split}: {} файлов — позитивов {n_pos} (групп исходников {n_pos_groups}), негативов {n_neg}\n",
         samples.len());
     println!("Кривая порогов. TPR — доля узнанных «Гермес»; FA — доля негативов, на которые сработало.");
-    println!("Порог выбирают по ней: вверх → меньше FA, но и TPR ниже. Цель: TPR ≥ 0.95 при минимальном FA.\n");
+    println!("Порог выбираем на val/development, на test только оцениваем заранее выбранный. Clip FA не равна FA/h.\n");
     println!("{:>6} {:>7} {:>8} {:>6} {:>6}", "порог", "TPR", "FA-доля", "FN", "FP");
     for &t in &THRESHOLDS {
         let (mut tp, mut fp) = (0usize, 0usize);
@@ -106,11 +108,12 @@ fn eval_split(split: &str, device: &WgpuDevice) {
             println!("  {p:.3} {kind:8} {}", s.path.file_name().unwrap().to_string_lossy());
         }
     }
-    println!("\nТочность измерения: TPR посчитан по {n_pos_groups} независимым исходникам — при 50 это ±13%, при 200 — ±6%.");
+    println!("\nTPR выше взвешен по файлам, включая аугментации. Групп позитивов: {n_pos_groups}; независимость сессий/дикторов не гарантирована. Интервал оценивай по независимому live-test (docs/07-quality.md).");
 }
 
 /// Режим score: распределение вероятностей по папке.
 fn score_dir(dir: &str, threshold: f32, device: &WgpuDevice) {
+    assert!(threshold.is_finite() && (0.0..=1.0).contains(&threshold), "порог должен быть в [0,1]");
     let files = wavs_in(dir);
     if files.is_empty() { panic!("в {dir} нет wav"); }
     let model = load_model(device);
@@ -120,7 +123,7 @@ fn score_dir(dir: &str, threshold: f32, device: &WgpuDevice) {
     let mut hist = [0usize; 10];
     for p in &probs { hist[((p * 10.0) as usize).min(9)] += 1; }
     println!("{}: {} файлов, порог {threshold}\n", dir, files.len());
-    println!("Гистограмма вероятностей «это Гермес»:");
+    println!("Гистограмма score «это Гермес» (не проверенная калибровка):");
     for (i, c) in hist.iter().enumerate() {
         let bar = "#".repeat(c * 60 / files.len().max(1));
         println!("  {:.1}–{:.1} {c:5} {bar}", i as f32 / 10.0, (i + 1) as f32 / 10.0);
@@ -137,8 +140,11 @@ fn score_dir(dir: &str, threshold: f32, device: &WgpuDevice) {
 
 /// Режим stream: скользящее окно по длинной записи, FA/час.
 fn stream(path: &str, hop_ms: usize, device: &WgpuDevice) {
+    assert!((1..=2000).contains(&hop_ms), "шаг должен быть от 1 до 2000 мс");
     let (samples, rate) = audio::read_wav(Path::new(path)).expect("wav не читается");
     assert_eq!(rate as usize, mfcc::SAMPLE_RATE, "нужен 16kHz: ffmpeg -i in -ac 1 -ar 16000 out.wav");
+    assert!(samples.len() >= WINDOW_SAMPLES, "для потока нужно минимум 1.2с аудио");
+    println!("FA/h корректна только для записи БЕЗ целевого слова. Энергетический гейт выключен.");
     let hours = samples.len() as f32 / rate as f32 / 3600.0;
     let hop = rate as usize * hop_ms / 1000;
     let model = load_model(device);
@@ -160,19 +166,21 @@ fn stream(path: &str, hop_ms: usize, device: &WgpuDevice) {
 
     // Детекция как на устройстве: порог превышен в 2 окнах подряд,
     // после срабатывания — cooldown 2с (не считать одно событие много раз).
-    println!("\nЛожные тревоги в час (2 окна подряд выше порога, cooldown 2с):");
+    println!("\nЛожные тревоги в час (2 окна подряд, cooldown floor(2000/шаг) шагов):");
     println!("{:>6} {:>10} {:>10} {:>12}", "порог", "окон>порога", "детекций", "FA/час");
     let cooldown = 2000 / hop_ms.max(1);
     for &t in &THRESHOLDS {
         let (mut above, mut det, mut run, mut cool) = (0usize, 0usize, 0usize, 0usize);
         for &p in &probs {
+            if p > t { above += 1; }
             if cool > 0 { cool -= 1; run = 0; continue; }
-            if p > t { above += 1; run += 1; } else { run = 0; }
+            if p > t { run += 1; } else { run = 0; }
             if run >= 2 { det += 1; cool = cooldown; run = 0; }
         }
         println!("{t:>6.2} {above:>10} {det:>10} {:>12.2}", det as f32 / hours.max(1e-6));
     }
-    println!("\nЦель проекта: ≤ 0.1 FA/час (1 за 10 часов) при пороге, где TPR ещё ≥ 0.95 (make eval).");
+    println!("\nЭто наблюдаемые частоты. Если событий 0, пуассоновская верхняя 95%-граница ≈ {:.3}/ч (допущения: docs/07-quality.md).", -0.05_f32.ln() / hours);
+    println!("Цель: ≤0.1 FA/ч вместе с event recall ≥0.95 на отдельном размеченном потоке; clip TPR из make eval его не заменяет.");
 }
 
 fn main() {

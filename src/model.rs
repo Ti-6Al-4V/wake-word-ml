@@ -64,9 +64,15 @@ impl<B: Backend> HermesNet<B> {
     }
 }
 
-/// Сигмоида на CPU: логит → вероятность.
+/// Сигмоида на CPU: логит → score (калибровка вероятности не гарантирована).
 pub fn sigmoid(logit: f32) -> f32 {
     1.0 / (1.0 + (-logit).exp())
+}
+
+/// BCE для конечного логита и бинарной метки. Не обрезает штраф
+/// уверенной ошибки, в отличие от sigmoid → clamp → log.
+pub fn binary_cross_entropy(logit: f32, label: f32) -> f32 {
+    logit.max(0.0) - label * logit + (-logit.abs()).exp().ln_1p()
 }
 
 /// Батч плоских признаков → тензор [b, 1, 40, 20].
@@ -75,4 +81,30 @@ pub fn batch_tensor<B: Backend>(feats: Vec<f32>, b: usize, device: &B::Device) -
         TensorData::new(feats, [b, 1, crate::mfcc::NUM_FRAMES, crate::mfcc::N_MFCC]),
         device,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bce_preserves_confident_error_penalty() {
+        assert!((binary_cross_entropy(0.0, 1.0) - 2.0_f32.ln()).abs() < 1e-6);
+        assert_eq!(binary_cross_entropy(100.0, 0.0), 100.0);
+        assert_eq!(binary_cross_entropy(-100.0, 1.0), 100.0);
+        assert!(binary_cross_entropy(100.0, 1.0) < 1e-6);
+        assert!(binary_cross_entropy(-100.0, 0.0) < 1e-6);
+    }
+
+    #[test]
+    fn bce_gradient_matches_sigmoid_minus_label() {
+        for logit in [-3.0, -0.5, 0.5, 3.0] {
+            for label in [0.0, 1.0] {
+                let eps = 0.001;
+                let numerical = (binary_cross_entropy(logit + eps, label)
+                    - binary_cross_entropy(logit - eps, label)) / (2.0 * eps);
+                assert!((numerical - (sigmoid(logit) - label)).abs() < 0.0003);
+            }
+        }
+    }
 }

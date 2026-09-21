@@ -2,18 +2,10 @@
 //! длины окна. Раньше каждый бинарь носил свою копию write_wav —
 //! теперь одна.
 //!
-//! Главное здесь — **дизер вместо цифровых нулей**. Когда файл короче
-//! окна (Speech Commands — 1.0с, TTS — 0.7с), хвост надо чем-то
-//! заполнить. Нули — худший выбор: в MFCC кадр из нулей даёт
-//! энергию 0 во всех полосах, log(0+ε) = −18 в каждой из 20 полос,
-//! и такой кадр торчит в матрице как флаг «здесь искусственная
-//! тишина». Настоящий микрофон никогда не выдаёт нули — у него всегда
-//! есть шум. Если нулевые хвосты есть только у одного класса (а у нас
-//! так: SC-негативы и TTS-позитивы обрезаны, живые дубли — нет),
-//! модель выучит этот флаг вместо слова.
-//!
-//! Дизер — равномерный шум около −60 дБFS (амплитуда ~0.001). На слух
-//! это тишина, для MFCC — правдоподобный микрофонный пол.
+//! Короткие файлы дополняются синтетическим шумом: peak −60 dBFS,
+//! RMS около −64.8 dBFS. Это выбранный способ уменьшить артефакт
+//! цифрового padding, а не измеренная модель микрофона. Сам padding
+//! тоже может стать признаком источника; проверяй оба класса и live-test.
 
 use std::path::Path;
 
@@ -30,11 +22,22 @@ pub const DITHER_AMP: f32 = 0.001;
 pub fn read_wav(path: &Path) -> Result<(Vec<f32>, u32), String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
+    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
+        return Err("нужен WAV PCM16 (ffmpeg: -c:a pcm_s16le)".into());
+    }
     let ch = spec.channels as usize;
+    if ch == 0 || spec.sample_rate == 0 {
+        return Err("некорректное число каналов или частота WAV".into());
+    }
     let raw: Vec<f32> = reader.samples::<i16>()
-        .filter_map(|s| s.ok())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
         .map(|s| s as f32 / 32768.0)
         .collect();
+    if raw.len() % ch != 0 {
+        return Err("неполный многоканальный кадр WAV".into());
+    }
     let mono: Vec<f32> = if ch <= 1 {
         raw
     } else {
@@ -124,6 +127,34 @@ pub fn speech_bounds(samples: &[f32], rate: u32, frac: f32) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wav_reader_downmixes_pcm16_and_rejects_float() {
+        let path = std::env::temp_dir().join(format!(
+            "wake-word-audio-test-{}-{}.wav", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let spec = hound::WavSpec {
+            channels: 2, sample_rate: 16_000, bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for sample in [16384_i16, -16384, 8192, 8192] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        let pcm = read_wav(&path);
+        let mut writer = hound::WavWriter::create(&path, hound::WavSpec {
+            channels: 1, bits_per_sample: 32, sample_format: hound::SampleFormat::Float,
+            ..spec
+        }).unwrap();
+        writer.write_sample(0.5_f32).unwrap();
+        writer.finalize().unwrap();
+        let float = read_wav(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(pcm.unwrap(), (vec![0.0, 0.25], 16_000));
+        assert!(float.unwrap_err().contains("PCM16"));
+    }
 
     #[test]
     fn fit_pads_with_dither_not_zeros() {
