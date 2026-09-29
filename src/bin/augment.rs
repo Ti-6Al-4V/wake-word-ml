@@ -1,4 +1,4 @@
-// Аугментация позитивов: из каждого исходного окна делает 8 вариантов.
+// Аугментация: из каждого позитива делает 8 вариантов, из негатива — 2.
 // Цель — научить модель узнавать слово независимо от фона, темпа,
 // уровня шума и положения в окне.
 //
@@ -14,6 +14,11 @@
 //                куда угодно, лишь бы влезло целиком). В стриминге слово
 //                оказывается в любой позиции — модель должна это видеть.
 //
+// Негативы (флаг --negatives): по NEG_VARIANTS разных варианта из v1–v7
+// на исходник. Если шум, фоны и скорость видит только класс «Гермес»,
+// модели проще выучить «зашумлено = Гермес», чем само слово. v8 негативам
+// не нужен: слова, которое надо двигать, в них нет.
+//
 // Почему нет вариантов «громкость ×0.7 / ×1.3» (были v1/v2 раньше):
 // после log-mel и нормализации по коэффициентам масштаб амплитуды
 // исчезает полностью — такие копии в пространстве признаков совпадают
@@ -26,8 +31,9 @@
 // ВАЖНО: исходниками служат только файлы БЕЗ "_v<цифры>" в имени — иначе
 // повторный запуск начал бы аугментировать уже аугментированное.
 //
-// Запуск: cargo run --bin augment -- <вход> <выход> [папка фонов]
+// Запуск: cargo run --bin augment -- <вход> <выход> [папка фонов] [--negatives]
 // Пример: cargo run --bin augment -- dataset/positive dataset/positive
+//         cargo run --bin augment -- dataset/negative dataset/negative --negatives
 
 use std::path::{Path, PathBuf};
 
@@ -37,11 +43,14 @@ use wake_word_ml::audio;
 const REAL_SNRS_DB: [f32; 2] = [15.0, 5.0];         // v1, v2
 const WHITE_SNRS_DB: [f32; 3] = [20.0, 10.0, 5.0];  // v5, v6, v7
 const DEFAULT_BG_DIR: &str = "dataset/raw/background";
+/// Сколько вариантов делать на один негатив.
+const NEG_VARIANTS: usize = 2;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let negatives = std::env::args().any(|a| a == "--negatives");
+    let args: Vec<String> = std::env::args().filter(|a| !a.starts_with("--")).collect();
     if args.len() < 3 {
-        eprintln!("Использование: augment <вход> <выход> [папка фонов]");
+        eprintln!("Использование: augment <вход> <выход> [папка фонов] [--negatives]");
         std::process::exit(1);
     }
     let in_dir = &args[1];
@@ -86,8 +95,8 @@ fn main() {
             }
         };
 
-        // 8 вариантов: v1..v8
-        for v in 1..=8usize {
+        let variants = variants_for(&stem, negatives);
+        for &v in &variants {
             let out_path = Path::new(out_dir).join(format!("{stem}_v{v}.wav"));
             if out_path.exists() {
                 skipped += 1;
@@ -118,9 +127,25 @@ fn main() {
             audio::write_wav(&out_path, &window, rate);
             done += 1;
         }
-        println!("[{done}] {stem} → 8 вариантов");
+        println!("[{done}] {stem} → варианты {variants:?}");
     }
     println!("\nГотово: создано {done}, уже было {skipped}. Выход: {out_dir}");
+}
+
+/// Номера вариантов для исходника: позитивам все v1–v8, негативу —
+/// NEG_VARIANTS разных из v1–v7, выбранных детерминированно по имени.
+fn variants_for(stem: &str, negatives: bool) -> Vec<usize> {
+    if !negatives {
+        return (1..=8).collect();
+    }
+    let mut pool: Vec<usize> = (1..=7).collect();
+    let mut rng = audio::rng_for(stem, 0);
+    for i in 0..NEG_VARIANTS {
+        let j = rng.random_range(i..pool.len());
+        pool.swap(i, j);
+    }
+    pool.truncate(NEG_VARIANTS);
+    pool
 }
 
 /// «_v» + цифры в конце имени = аугментированный файл.
@@ -201,4 +226,25 @@ fn random_position(samples: &[f32], rate: u32, rng: &mut impl Rng) -> Vec<f32> {
     let max_offset = samples.len() - word.len();
     let offset = rng.random_range(0..=max_offset);
     audio::fit_to_len(word, samples.len(), offset, rng)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positives_get_all_eight_variants() {
+        assert_eq!(variants_for("germes_real_0001", false), (1..=8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn negatives_get_distinct_deterministic_variants_without_shift() {
+        for stem in ["golos_p00042_c03", "negative_sc_00017", "self_s01_c0007"] {
+            let v = variants_for(stem, true);
+            assert_eq!(v, variants_for(stem, true));
+            assert_eq!(v.len(), NEG_VARIANTS);
+            assert!(v.iter().all(|x| (1..=7).contains(x)));
+            assert_ne!(v[0], v[1]);
+        }
+    }
 }

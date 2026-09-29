@@ -1,6 +1,6 @@
 .PHONY: generate_tts record record_confusables record_speech chop check preprocess augment \
         negatives clone_sample download-data mfcc-check split-check train eval score stream \
-        rebuild-dataset test
+        rebuild-dataset test augment-neg record_holdout record_holdout_speech holdout
 
 # Число дублей за сессию записи (по умолчанию 20).
 # Переопределяется: make record N=50
@@ -79,6 +79,31 @@ preprocess:
 augment:
 	cargo run --bin augment -- dataset/positive dataset/positive
 
+# Те же шумы/фоны/скорость для негативов (2 варианта на файл, идемпотентно).
+# Запускать после того, как в dataset/negative добавлены все источники.
+augment-neg:
+	cargo run --bin augment -- dataset/negative dataset/negative dataset/raw/background --negatives
+
+# ---------- holdout: честный test ----------
+# Живые люди, которых НЕТ в train: друзья, родные, коллеги, их телефоны.
+# Имя диктора — P (p001, p002...), файлы получают префикс <P>__, по нему
+# group_key держит все записи человека вместе. Не аугментируется.
+#   make record_holdout P=p001 N=10
+#   make record_holdout_speech P=p001 SECS=60
+#   make holdout
+P ?= p001
+record_holdout:
+	cargo run --bin record -- dataset/raw/holdout/real $(N) Гермес "$(P)__germes"
+
+record_holdout_speech:
+	cargo run --bin record_sample -- dataset/raw/holdout/speech/$(P)__speech.wav $(SECS) speech
+
+holdout:
+	cargo run --bin preprocess -- dataset/raw/holdout/real dataset/holdout/positive
+	cargo run --bin chop -- dataset/raw/holdout/speech dataset/raw/holdout/speech_clips
+	cargo run --bin preprocess -- dataset/raw/holdout/speech_clips dataset/holdout/negative
+	cargo run --release --bin split_check
+
 # Полная пересборка производных данных (raw/ не трогается). Нужна после
 # смены preprocess/augment/extract_golos — старые файлы иначе останутся
 # (пайплайн только добавляет, никогда не удаляет).
@@ -92,6 +117,7 @@ rebuild-dataset:
 	cargo run --bin preprocess -- dataset/raw/golos_clips dataset/negative
 	@test -d dataset/raw/self_speech_clips && cargo run --bin preprocess -- dataset/raw/self_speech_clips dataset/negative || true
 	@test -d dataset/raw/confusables && cargo run --bin preprocess -- dataset/raw/confusables dataset/negative || true
+	cargo run --bin augment    -- dataset/negative dataset/negative dataset/raw/background --negatives
 
 # ---------- проверки ----------
 
@@ -104,9 +130,9 @@ mfcc-check:
 split-check:
 	cargo run --bin split_check
 
-# Юнит-тесты библиотеки (MFCC, дизер, группировка)
+# Юнит-тесты: библиотека (MFCC, дизер, сплит) и выбор вариантов аугментации
 test:
-	cargo test --lib
+	cargo test --lib --bin augment
 
 # ---------- обучение и оценка ----------
 

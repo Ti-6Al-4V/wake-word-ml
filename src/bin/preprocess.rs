@@ -3,7 +3,7 @@
 // пиковая нормализация до 0.9. Короткие файлы дополняются ДИЗЕРОМ
 // (шум −60 дБFS), а не нулями — почему, см. src/audio.rs.
 //
-// Понимает и WAV, и MP3: декодирование и ресемплинг делегируем ffmpeg
+// Понимает WAV, MP3 и телефонные форматы (m4a/ogg/opus/flac/aac): декодирование и ресемплинг делегируем ffmpeg
 // (единственная внешняя зависимость; качество ресемпла у него отличное).
 // Идемпотентен: если выходной файл уже есть — пропускает (можно
 // дозаписывать дубли и просто перезапускать).
@@ -42,19 +42,19 @@ fn main() {
 
     std::fs::create_dir_all(out_dir).expect("не создать выходную папку");
 
-    // Собираем входные файлы: wav и mp3, сортируем для стабильного порядка.
+    // Собираем входные аудиофайлы, сортируем для стабильного порядка.
     let mut files: Vec<PathBuf> = std::fs::read_dir(in_dir)
         .unwrap_or_else(|e| panic!("не открыть {in_dir}: {e}"))
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| matches!(
             p.extension().and_then(|x| x.to_str()).map(|x| x.to_lowercase()).as_deref(),
-            Some("wav") | Some("mp3")
+            Some("wav" | "mp3" | "m4a" | "ogg" | "opus" | "flac" | "aac")
         ))
         .collect();
     files.sort();
     if files.is_empty() {
-        eprintln!("В {in_dir} нет .wav/.mp3 файлов");
+        eprintln!("В {in_dir} нет аудиофайлов (wav/mp3/m4a/ogg/opus/flac/aac)");
         std::process::exit(1);
     }
 

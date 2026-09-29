@@ -395,32 +395,33 @@ make preprocess IN=dataset/raw/real OUT=dataset/positive             # новы�
 make augment                                                         # докинет варианты только для новых
 ```
 
-## Состояние на 2026-09-13
+## Состояние на 2026-09-29
 
 | Этап | Статус |
 |------|--------|
 | 0 окружение | ✅ ffmpeg, uv, edge-tts, JBL-гарнитура |
-| 1 TTS | ✅ 31 файл |
-| 2 свой голос | ✅ 306 годных дублей (цель 300 закрыта; опционально до 500) |
-| 2b негативы своим голосом | ⬜ инструменты готовы, записей нет — **следующий шаг** |
-| 3 негативы | ✅ 6000 (Golos 4000 + SC 2000) + 6 шумов — **пересобрать** (`make rebuild-dataset`: дизер, имена Golos) |
-| 4 препроцессинг | ✅ код обновлён (дизер) — данные пересобрать |
-| 5 аугментация | ✅ код обновлён (реальные фоны, сдвиг по окну) — данные пересобрать |
-| 6 обучение | ✅ код готов; первая модель 2026-08-19 (1 эпоха) устарела вместе с данными |
-| 7 оценка | ✅ eval/score/stream готовы; ambient-запись для FA/час не скачана |
+| 1 TTS | ✅ 31 файл, 2 голоса Edge — для цели «любой голос» мало |
+| 2 свой голос | ✅ 306 дублей — один диктор |
+| 2b негативы своим голосом | ⬜ записей нет |
+| 3 негативы | ✅ 6000 (Golos 4000 + SC 2000) + 6 фонов |
+| 4 препроцессинг | ✅ |
+| 5 аугментация | ✅ позитивы; негативы — `make augment-neg` (новое) |
+| 5b holdout-дикторы | ⬜ `make record_holdout` / `make holdout` (новое) |
+| 5c синтетические дикторы | ⬜ генератор не написан — этап 4 плана |
+| 6 обучение | ✅ код; модели нет |
+| 7 оценка | ✅ eval/score/stream; ambient-запись для FA/час не собрана |
 | 8 экспорт | ⬜ заглушка |
 
-Порядок действий с этого места:
+Порядок действий — этап 4 [плана](00-learning-path.md):
 
 ```bash
-make test                                   # юнит-тесты библиотеки
-make rebuild-dataset                        # производные данные заново
-make record_speech SECS=300 && make chop    # этап 2b (и двойники)
-make score DIR=...                          # проверка лазейки ДО добавления речи в датасет (нужна модель: make train)
-make preprocess IN=dataset/raw/self_speech_clips OUT=dataset/negative
-make split-check && make train E=30 && make eval
+make test
+make record_holdout P=p001 N=10 && make record_holdout_speech P=p001 SECS=60   # на каждого человека
+make holdout
+make record_speech SECS=300 && make chop && make preprocess IN=dataset/raw/self_speech_clips OUT=dataset/negative
+make augment-neg
+make split-check    # test должен быть holdout
 ```
-
 
 ## Воспроизводимость после изменения данных
 

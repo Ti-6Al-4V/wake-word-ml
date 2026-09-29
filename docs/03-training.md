@@ -10,7 +10,7 @@
 | Файл | Что |
 |---|---|
 | `src/model.rs` | `HermesNet` — архитектура, одна для train/eval/export. `sigmoid`, `batch_tensor` |
-| `src/dataset.rs` | сплит 70/15/15 с группировкой по исходнику, `features_flat` |
+| `src/dataset.rs` | сплит по дикторам: train/val 85/15 + holdout-test (без holdout — 70/15/15), `features_flat` |
 | `src/mfcc.rs` | признаки: 40×20, log-пол, CMVN по коэффициенту |
 | `src/bin/train.rs` | ручной цикл обучения, кэш признаков, чекпоинт, CSV-лог |
 | `src/bin/eval.rs` | кривая порогов, score по папке, стриминг FA/час |
@@ -40,7 +40,7 @@ let logits: Tensor<B, 1> = model.forward(x);   // x: Tensor<B, 4> = [b,1,40,20]
 make train E=30 BATCH=64 LR=0.001 DROPOUT=0.2 WD=0.0001
 
 Backend::seed(&device, 42)                    — воспроизводимая инициализация
-splits = dataset::load(positive, negative)    — 70/15/15
+splits = dataset::load(positive, negative)    — train/val + holdout-test
 train/val признаки → кэш в памяти             — MFCC один раз
 for epoch:
     перемешать индексы (сид 42+epoch)
